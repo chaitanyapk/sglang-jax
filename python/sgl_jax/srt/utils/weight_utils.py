@@ -48,6 +48,23 @@ def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> n
     return data
 
 
+def unpack_4bit(packed_data: np.ndarray, packing_factor: int, is_signed: bool = True) -> np.ndarray:
+    """Unpack packed integers (e.g. packed in uint8 or int32) to 4-bit values on CPU."""
+    bits_per_container = packed_data.dtype.itemsize * 8
+    bits_per_element = bits_per_container // packing_factor
+    
+    shifts = np.arange(0, bits_per_container, bits_per_element, dtype=np.int32)
+    unpacked = (packed_data[..., None] >> shifts) & 0x0F
+    
+    new_shape = packed_data.shape[:-1] + (packed_data.shape[-1] * packing_factor,)
+    unpacked = unpacked.reshape(new_shape)
+    
+    if is_signed:
+        unpacked = np.where(unpacked >= 8, unpacked - 16, unpacked)
+        
+    return unpacked
+
+
 @dataclass
 class WeightMapping:
     target_path: str | list[str]
@@ -1028,6 +1045,7 @@ class WeightLoader:
         infos: list[dict],
         file_manager: SequentialSafetensorManager,
         target_sharding: jax.sharding.NamedSharding = None,
+        expected_shape: tuple[int, ...] | None = None,
     ) -> list[jax.Array]:
         """
         Create a list of JAX arrays that lazy load data from safetensors via callback.
@@ -1051,6 +1069,23 @@ class WeightLoader:
             }
             target_dtype = dtype_map.get(st_dtype, jnp.float32)
 
+            # Detect packing based on shape mismatch on the last dimension
+            is_packed = False
+            packing_factor = 1
+            global_shape = shape
+
+            if expected_shape is not None and len(expected_shape) == len(shape):
+                file_last_dim = shape[-1]
+                model_last_dim = expected_shape[-1]
+                if model_last_dim > file_last_dim and model_last_dim % file_last_dim == 0:
+                    is_packed = True
+                    packing_factor = model_last_dim // file_last_dim
+                    global_shape = expected_shape
+                    logger.info(
+                        "Detected packed 4-bit weight for %s: file shape %s -> target shape %s (packing_factor=%d)",
+                        hf_key, shape, expected_shape, packing_factor
+                    )
+
             filename = info["file"]
 
             if target_sharding is not None:
@@ -1060,15 +1095,29 @@ class WeightLoader:
                 # Fallback: Load full tensor on every host (Replicated)
                 sharding = jax.sharding.NamedSharding(self.mesh, P())
 
-            def _make_load_slice(fname=filename, fm=file_manager, target_dtype=target_dtype):
+            def _make_load_slice(fname=filename, fm=file_manager, target_dtype=target_dtype,
+                                 is_packed=is_packed, packing_factor=packing_factor):
                 def _load_slice(index):
                     f = fm.get_handle(fname)
-                    data = f.get_slice(hf_key)[index]
-                    return _reinterpret_dtype_if_needed(data, target_dtype)
+                    if is_packed:
+                        last_axis_slice = index[-1]
+                        start, stop, step = last_axis_slice.indices(global_shape[-1])
+                        assert step == 1 or step is None, "Strided slicing not supported for packed weights"
+                        
+                        packed_index = list(index)
+                        packed_index[-1] = slice(start // packing_factor, stop // packing_factor)
+                        packed_index = tuple(packed_index)
+                        
+                        packed_data = f.get_slice(hf_key)[packed_index]
+                        unpacked_data = unpack_4bit(packed_data, packing_factor)
+                        return unpacked_data.astype(target_dtype)
+                    else:
+                        data = f.get_slice(hf_key)[index]
+                        return _reinterpret_dtype_if_needed(data, target_dtype)
 
                 return _load_slice
 
-            lazy_array = jax.make_array_from_callback(shape, sharding, _make_load_slice()).astype(
+            lazy_array = jax.make_array_from_callback(global_shape, sharding, _make_load_slice()).astype(
                 target_dtype
             )
 
@@ -1083,6 +1132,7 @@ class WeightLoader:
         file_manager: SequentialSafetensorManager,
         concat_axis: int,
         target_sharding: jax.sharding.NamedSharding = None,
+        expected_shape: tuple[int, ...] | None = None,
     ) -> jax.Array:
         """
         Lazy loader for TP-Split weights (e.g., Grok Attention/MLP).
@@ -1111,6 +1161,21 @@ class WeightLoader:
         global_shape = list(base_shape)
         global_shape[concat_axis] = cumulative_start
         global_shape = tuple(global_shape)
+
+        # Detect packing
+        is_packed = False
+        packing_factor = 1
+        if expected_shape is not None and len(expected_shape) == len(global_shape):
+            file_last_dim = global_shape[-1]
+            model_last_dim = expected_shape[-1]
+            if model_last_dim > file_last_dim and model_last_dim % file_last_dim == 0:
+                is_packed = True
+                packing_factor = model_last_dim // file_last_dim
+                global_shape = expected_shape
+                logger.info(
+                    "Detected packed 4-bit split weight for %s: file shape %s -> target shape %s (packing_factor=%d)",
+                    hf_key, base_shape, expected_shape, packing_factor
+                )
 
         st_dtype = sorted_infos[0]["dtype"]
         dtype_map = {
@@ -1154,11 +1219,22 @@ class WeightLoader:
                     # Construct read index for this file
                     file_read_index = list(index)
                     file_read_index[concat_axis] = slice(local_start, local_end)
+                    
+                    if is_packed:
+                        last_axis_slice = file_read_index[-1]
+                        start, stop, step = last_axis_slice.indices(global_shape[-1])
+                        assert step == 1 or step is None, "Strided slicing not supported for packed weights"
+                        file_read_index[-1] = slice(start // packing_factor, stop // packing_factor)
+
                     file_read_index = tuple(file_read_index)
 
                     # Read directly
                     f = file_manager.get_handle(info["file"])
                     chunk = f.get_slice(hf_key)[file_read_index]
+                    
+                    if is_packed:
+                        chunk = unpack_4bit(chunk, packing_factor)
+                        
                     collected_chunks.append(chunk)
 
             if not collected_chunks:
@@ -1897,6 +1973,10 @@ class WeightLoader:
                         spec = P(*sharding_tuple)
                         final_sharding = jax.sharding.NamedSharding(self.mesh, spec)
 
+                        target_path = mapping.target_path
+                        model_param = self._get_param(params, target_path)
+                        expected_shape = model_param.value.shape if hasattr(model_param, "value") and hasattr(model_param.value, "shape") else None
+
                         lazy_weight = None
 
                         if is_split_weight:
@@ -1906,6 +1986,7 @@ class WeightLoader:
                                 file_manager,
                                 concat_axis=mapping.concat_axis,
                                 target_sharding=final_sharding,
+                                expected_shape=expected_shape,
                             )
                         else:
                             lazy_arrays = self._create_lazy_tensors(
@@ -1913,6 +1994,7 @@ class WeightLoader:
                                 infos,
                                 file_manager,
                                 target_sharding=final_sharding,
+                                expected_shape=expected_shape,
                             )
                             lazy_weight = lazy_arrays[0]
 
@@ -1929,9 +2011,6 @@ class WeightLoader:
                                 lazy_weight.astype(jnp.float32)
                                 * self.model_config.hf_config.output_multiplier_scale
                             )
-
-                        target_path = mapping.target_path
-                        model_param = self._get_param(params, target_path)
 
                         # Expand 2D block-quant scale to 3D kernel-ready layout.
                         lazy_weight = self._maybe_expand_linear_block_scale(

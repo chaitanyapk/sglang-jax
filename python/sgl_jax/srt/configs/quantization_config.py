@@ -9,8 +9,13 @@ import os
 from dataclasses import dataclass
 from numbers import Integral
 
+import jax
 import jax.numpy as jnp
 import yaml
+
+# Try to get native 4-bit integer dtypes if supported by JAX, otherwise fall back to int8/uint8
+int4_dtype = getattr(jnp, "int4", None) or getattr(jax.dtypes, "int4", None)
+uint4_dtype = getattr(jnp, "uint4", None) or getattr(jax.dtypes, "uint4", None)
 
 # Map string dtype names to JAX numpy dtypes
 DTYPE_MAP = {
@@ -19,8 +24,11 @@ DTYPE_MAP = {
     "float8_e5m2": jnp.float8_e5m2,
     "bfloat16": jnp.bfloat16,
     "float32": jnp.float32,
+    "int4": int4_dtype if int4_dtype is not None else jnp.int8,
+    "uint4": uint4_dtype if uint4_dtype is not None else jnp.uint8,
     None: None,
 }
+
 
 # Path to built-in quantization config files
 BUILTIN_CONFIG_PATH = os.path.join(

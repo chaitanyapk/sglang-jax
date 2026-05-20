@@ -1,0 +1,17 @@
+# INT4 weight-only quantization config
+# Works for both linear and MoE models
+# Uses per-channel weight quantization
+
+quantization:
+  is_static_checkpoint: true
+
+  # Quantization rules for linear layers (attention, MLP, embeddings)
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'int4'
+
+  # MoE-specific settings (experts weights)
+  moe:
+    weight_dtype: 'int4'
+    activation_dtype: null

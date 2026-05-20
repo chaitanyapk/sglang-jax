@@ -12,6 +12,7 @@ from jax.sharding import Mesh
 from transformers import modeling_flax_utils
 
 from sgl_jax.srt.layers.embeddings import Embed
+from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import (
     KimiK25ModelVitConfig,
 )
@@ -70,14 +71,13 @@ class KimiK25VisionAttention(nnx.Module):
     ):
         self.mesh = mesh
 
-        _rngs = rngs or nnx.Rngs(0)
-
-        self.qkv_proj = nnx.Linear(
-            self.vt_hidden_size,
-            3 * self.vt_hidden_size,
+        self.qkv_proj = LinearBase(
+            input_size=config.vt_hidden_size,
+            output_size=3 * config.vt_hidden_size,
             use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
+            params_dtype=dtype,
+            mesh=mesh,
+            scope_name="qkv_proj",
         )
 
 
@@ -93,31 +93,33 @@ class KimiK25VisionMLP(nnx.Module):
         in_features = config.vt_hidden_size
         intermediate_size = config.vt_intermediate_size
 
-        _rngs = rngs or nnx.Rngs(0)
-
         self.mesh = mesh
 
-        self.up_proj = nnx.Linear(
-            in_features,
-            intermediate_size,
+        self.up_proj = LinearBase(
+            input_size=in_features,
+            output_size=intermediate_size,
             use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
+            params_dtype=dtype,
+            mesh=mesh,
+            scope_name="up_proj",
         )
 
-        self.down_proj = nnx.Linear(
-            intermediate_size,
-            in_features,
+        self.down_proj = LinearBase(
+            input_size=intermediate_size,
+            output_size=in_features,
             use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
+            params_dtype=dtype,
+            mesh=mesh,
+            scope_name="down_proj",
         )
 
         self.act_fn = modeling_flax_utils.ACT2FN[config.projector_hidden_act] # TODO: Verify if this is the right param
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        up = self.act_fn(self.up_proj(x))
-        return self.down_proj(up)
+        up, _ = self.up_proj(x)
+        up = self.act_fn(up)
+        out, _ = self.down_proj(up)
+        return out
 
 
 class KimiK25VisionBlock(nnx.Module):
@@ -144,12 +146,13 @@ class KimiK25VisionBlock(nnx.Module):
         _rngs = rngs or nnx.Rngs(0)
         self.pre_norm = norm_layer(config.vt_hidden_size, dtype=dtype, rngs=_rngs)
 
-        self.proj = nnx.Linear(
-            self.vt_hidden_size,
-            self.vt_hidden_size,
+        self.proj = LinearBase(
+            input_size=config.vt_hidden_size,
+            output_size=config.vt_hidden_size,
             use_bias=True,
-            param_dtpe=dtype,
-            rngs=_rngs,
+            params_dtype=dtype,
+            mesh=mesh,
+            scope_name="proj",
         )
 
         self.post_norm = norm_layer(config.vt_hidden_size, dtype=dtype, rngs=_rngs)
