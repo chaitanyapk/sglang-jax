@@ -11,14 +11,14 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.managers.schedule_batch import ForwardMode, ModelWorkerBatch  
 from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool, MemoryPools  
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch  
-from sgl_jax.srt.multimodal.models.kimi_k25.kimi_vl_generation import (  
+from sgl_jax.srt.multimodal.models.kimi_k25.kimi_k25_vl_generation import (  
     KimiK25ForConditionalGeneration,  
 )  
   
 logging.basicConfig(level=logging.INFO)  
 logger = logging.getLogger(__name__)  
   
-MODEL_PATH = "/path/to/kimi-k2.5"  
+MODEL_PATH = "/local/kimi"  
 PAGE_SIZE = 128   # MLAAttentionBackend asserts page_size > 1  
   
   
@@ -38,7 +38,7 @@ def main():
     text_config.quantization_config = None   # avoid dict-vs-object error  
   
     # ── 3. Create model (eval_shape) + load weights ──────────────────────────  
-    with jax.sharding.use_mesh(mesh):  
+    with jax.sharding.set_mesh(mesh):  
         model = nnx.eval_shape(  
             lambda: KimiK25ForConditionalGeneration(  
                 model_config.hf_config, mesh=mesh, dtype=jnp.bfloat16  
@@ -50,7 +50,7 @@ def main():
     # ── 4. KV pool + MemoryPools ─────────────────────────────────────────────  
     # Keep pool small: 10 pages × PAGE_SIZE tokens each  
     pool_size = PAGE_SIZE * 10  
-    with jax.sharding.use_mesh(mesh):  
+    with jax.sharding.set_mesh(mesh):  
         kv_pool = MLATokenToKVPool(  
             size=pool_size,  
             page_size=PAGE_SIZE,  
@@ -75,7 +75,7 @@ def main():
     )  
   
     # ── 6. Dummy batch data ──────────────────────────────────────────────────  
-    seq_len = 10  
+    seq_len = 16  
     bs = 1  
   
     input_ids_np      = np.arange(1, seq_len + 1, dtype=np.int32)  
@@ -146,7 +146,7 @@ def main():
   
     # ── 10. Forward pass ─────────────────────────────────────────────────────  
     logger.info("Running forward pass...")  
-    with jax.sharding.use_mesh(mesh):  
+    with jax.sharding.set_mesh(mesh):  
         output, layers_kv_fused, _, layers_topk_ids = model(  
             fb, memory_pools, logits_metadata  
         )  

@@ -15,7 +15,7 @@ from sgl_jax.srt.multimodal.models.kimi_k25.kimi_k25_vl_generation import (
 logging.basicConfig(level=logging.INFO)  
 logger = logging.getLogger(__name__)  
   
-MODEL_PATH = "local/kimi"  # update this  
+MODEL_PATH = "/local/kimi"  # update this  
   
   
 def test_weight_loading():  
@@ -43,7 +43,7 @@ def test_weight_loading():
     )
   
     # 3. Create model shape (no real weights yet) inside mesh context  
-    with jax.sharding.use_mesh(mesh):  
+    with jax.sharding.set_mesh(mesh):  
         model = nnx.eval_shape(  
             lambda: KimiK25ForConditionalGeneration(  
                 config=model_config.hf_text_config,  
@@ -54,7 +54,7 @@ def test_weight_loading():
     logger.info("Model shape created successfully")  
   
     # 4. Load weights (allocates real arrays and fills from safetensors)  
-    with jax.sharding.use_mesh(mesh):  
+    with jax.sharding.set_mesh(mesh):  
         model.load_weights(model_config)  
     logger.info("Weights loaded successfully")  
   
