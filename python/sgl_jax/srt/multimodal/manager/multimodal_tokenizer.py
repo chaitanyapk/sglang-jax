@@ -581,7 +581,7 @@ class MultimodalTokenizer(TokenizerManager):
                 "mm_items": mm_items,
                 "im_start_id": getattr(self.mm_config, "vision_start_token_id", None),
                 "im_end_id": getattr(self.mm_config, "vision_end_token_id", None),
-                "im_token_id": getattr(self.mm_config, "image_token_id", None),
+                "im_token_id": getattr(self.mm_config, "image_token_id", None) or getattr(self.mm_config, "media_placeholder_token_id", None),
                 "video_token_id": getattr(self.mm_config, "video_token_id", None),
                 "audio_token_id": getattr(self.mm_config, "audio_token_id", None),
                 "mrope_positions": mrope_positions,

@@ -540,6 +540,26 @@ def _execute_multimodal_server_warmup(
             ],
             "max_tokens": 3,
         }
+    elif "Kimi-K2.5" in server_args.model_path:
+        request_endpoint = "/v1/chat/completions"
+        json_data = {
+            "model": "ananayarora/Kimi-K2.5-BF16", # Update with original moonshotai weights
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What can you see in this image?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://github.com/IS-Model-Framework/sglang-jax/blob/dev/vl/test/srt/example_image.png?raw=true"
+                            },
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": 3,
+        }
     elif "Qwen3-Omni" in server_args.model_path:
         request_endpoint = "/v1/chat/completions"
         json_data = {

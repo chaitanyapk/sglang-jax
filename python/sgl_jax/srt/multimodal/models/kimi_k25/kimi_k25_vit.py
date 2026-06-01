@@ -514,12 +514,23 @@ class Kimi_K25_VisionModel(nnx.Module):
         self.mesh = mesh
 
         self.vision_tower = VisionTower(config, dtype, rngs, mesh, config.projector_ln_eps)
+        self.mm_projector = Kimi_K25_MultiModalProjector(config, dtype, rngs)
 
         logger.info("Kimi K2.5 Vision Model initialized with dtype %s", dtype)
 
 
     def load_weights(self, model_config: KimiK25ModelVitConfig) -> None:
         '''Load model weights with JAX distributed loading support'''
+
+        if not hasattr(self, "text_embed"):
+            self.text_embed = Embed(
+                num_embeddings=,
+                features=,
+                dtype=self.dtype,
+                param_dtype=self.dtype,
+                kernel_axes=(None, None),
+                mesh=self.mesh,
+            )
 
         loader = WeightLoader(
             model=self,
@@ -540,6 +551,12 @@ class Kimi_K25_VisionModel(nnx.Module):
 
     def _create_kimi_k25_vision_tower_weight_mappings(self) -> dict:
         mappings = {}
+
+        mappings["language_mode.model.embed_tokens.weight"] = WeightMapping(
+            target_path="text_embed.embedding",
+            sharding=(None, None),
+            transpose=False,
+        )
 
         mappings.update(
             {

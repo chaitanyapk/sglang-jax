@@ -7,7 +7,7 @@ from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
-from sgl_jax.srt.multimodal.configs.config_registry import get_qwen_vl_config
+from sgl_jax.srt.multimodal.configs.config_registry import get_qwen_vl_config, get_kimi_vl_config
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
 
@@ -34,7 +34,11 @@ class VitModelRunner(BaseModelRunner):
         self.initialize_jit()
 
     def load_model(self):
-        self.model_config = get_qwen_vl_config(self.server_args.model_path)
+        if "kimi" in self.server_args.model_path.lower() or "kimi-k2.5" in self.server_args.model_path.lower():
+            self.model_config = get_kimi_vl_config(self.server_args.model_path)
+        else:
+            self.model_config = get_qwen_vl_config(self.server_args.model_path)
+
         self.model_config.model_path = self.server_args.model_path
         self.model_config.model_class = self.model_class
         self.model = self.model_loader.load_model(
@@ -139,21 +143,33 @@ class VitModelRunner(BaseModelRunner):
         return jnp.where(condition, update_values, text_embeds)
 
     def forward(self, batch: Req, mesh: jax.sharding.Mesh):
-        vision_embeds = self.jitted_encode_vision(
-            pixel_values=batch.pixel_values,
-            image_grid_thw=batch.image_grid_thw,
-            video_grid_thw=batch.video_grid_thw,
-        )
-        mm_inputs = batch.omni_inputs if isinstance(batch.omni_inputs, dict) else None
-        if mm_inputs is not None:
-            input_ids = batch.input_ids or batch.origin_input_ids
-            if input_ids is not None:
-                input_ids = jnp.asarray(input_ids)
-                merged_embeds = self._merge_multimodal_embeddings(
-                    input_ids=input_ids,
-                    vision_embeds=vision_embeds,
-                    mm_inputs=mm_inputs,
-                )
-                if merged_embeds is not None:
-                    mm_inputs["multimodal_embedding"] = merged_embeds
-        return batch
+        vision_embeds = self.vision_tower(
+                            pixel_values=batch.pixel_values,
+                            grid_thws=batch.image_grid_thw,
+                        )
+
+        print("Vision embeddings successfully calculated", flush=True)
+
+        # TODO: Complete the mm_projector weight loading
+        vision_embeds = self.mm_projector(vision_embeds)
+
+        print("Vision embeddings successfully worked with mm_projection" flush=True)
+
+#        vision_embeds = self.jitted_encode_vision(
+#            pixel_values=batch.pixel_values,
+#            image_grid_thw=batch.image_grid_thw,
+#            video_grid_thw=batch.video_grid_thw,
+#        )
+#        mm_inputs = batch.omni_inputs if isinstance(batch.omni_inputs, dict) else None
+#        if mm_inputs is not None:
+#            input_ids = batch.input_ids or batch.origin_input_ids
+#            if input_ids is not None:
+#                input_ids = jnp.asarray(input_ids)
+#                merged_embeds = self._merge_multimodal_embeddings(
+#                    input_ids=input_ids,
+#                    vision_embeds=vision_embeds,
+#                    mm_inputs=mm_inputs,
+#                )
+#                if merged_embeds is not None:
+#                    mm_inputs["multimodal_embedding"] = merged_embeds
+#        return batch

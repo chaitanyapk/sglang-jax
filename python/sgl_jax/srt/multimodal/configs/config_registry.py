@@ -10,6 +10,7 @@ from sgl_jax.srt.multimodal.configs.mimo_audio.mimo_audio_backbone_config import
     MiMoAudioBackboneConfig,
 )
 from sgl_jax.srt.multimodal.configs.mimo_audio.mimo_audio_config import MiMoAudioConfig
+from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import KimiK25ModelVitConfig
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
@@ -370,6 +371,66 @@ class VAEConfigRegistry:
         return list(cls._REGISTRY.keys())
 
 
+class KimiVLConfigRegistry:
+    # Model name -> config factory mapping
+    _REGISTRY: dict[str, callable] = {
+        "moonshotai/Kimi-K2.5": lambda: KimiK25ModelVitConfig(),
+        "ananayarora/Kimi-K2.5-BF16": lambda: KimiK25ModelVitConfig(),
+    }
+
+    # Keyword patterns for fallback matching (order matters - more specific first)
+    _KEYWORD_PATTERNS: list[tuple[str, callable]] = [
+        ("Kimi-K2.5", lambda: KimiK25ModelVitConfig()),
+    ]
+
+    @classmethod
+    def register(cls, model_name: str, config_factory: callable) -> None:
+        cls._REGISTRY[model_name] = config_factory
+        logger.info("Registered Kimi-K2.5 config '%s'", model_name)
+
+    @classmethod
+    def get_config(cls, model_path: str) -> KimiK25ModelVitConfig:
+        model_name = cls._extract_model_name(model_path)
+
+        # Try exact match first
+        config_factory = cls._REGISTRY.get(model_name)
+        if config_factory:
+            logger.debug("Found exact KimiK25 config match for model '%s'", model_name)
+            return config_factory() # TODO: Handle the values overrides for KimiK2.5
+
+        # Try matching with full model_path (for HF-style repo IDs)
+        config_factory = cls._REGISTRY.get(model_path)
+        if config_factory:
+            logger.debug("Found KimiK25 config match for full model path '%s'", model_path)
+            return config_factory()
+
+        # Try keyword pattern matching
+        for keyword, factory in cls._KEYWORD_PATTERNS:
+            if keyword in model_name or keyword in model_path:
+                logger.debug(
+                    "Found KimiK2.5 config keyword match '%s' for model '%s'", keyword, model_name
+                )
+                return config_factory()
+
+        # No match found
+        available_models = list(cls._REGISTRY.keys())
+        raise ValueError(
+            f"No VIT config found for model '{model_path}'. "
+            f"Available models: {available_models}. "
+            f"You can register new models using KimiVLConfig.register()."
+        )
+
+    @classmethod
+    def _extract_model_name(cls, model_path: str) -> str:
+        """Extract the model name from a model path."""
+        model_path = model_path.rstrip("/")
+        return os.path.basename(model_path)
+
+    @classmethod
+    def list_registered_models(cls) -> list[str]:
+        """List all registered model names."""
+        return list(cls._REGISTRY.keys())
+
 class QwenVLConfigRegistry:
     # Model name -> config factory mapping
     _REGISTRY: dict[str, callable] = {
@@ -453,6 +514,16 @@ def get_vae_config(model_path: str) -> WanVAEConfig:
     """
     return VAEConfigRegistry.get_config(model_path)
 
+
+def get_kimi_vl_config(model_path: str) -> KimiK25ModelVitConfig:
+    """Convenience function to get Kimi vl config.
+    Args:
+        model_path: The model path from server args.
+
+    Returns:
+        A VAE config instance configured for the specified model.
+    """
+    return KimiVLConfigRegistry.get_config(model_path)
 
 def get_qwen_vl_config(model_path: str) -> QwenVLModelVitConfig:
     """Convenience function to get Qwen vl config.
