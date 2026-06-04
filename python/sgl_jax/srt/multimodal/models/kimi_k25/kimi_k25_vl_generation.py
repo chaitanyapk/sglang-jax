@@ -10,6 +10,7 @@ from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
 from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.layers.moe import create_moe_weights_mapping
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Model
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -93,6 +94,13 @@ class KimiK25ForConditionalGeneration(nnx.Module):
         self.text_config = get_hf_text_config(config) or config
         self.dtype = dtype or jnp.bfloat16
         self.mesh = mesh
+
+        # TODO: Validate if any other fix can make it work smoothly
+        # text_config.quantization_config may be a raw dict from the JSON.
+        # ModelConfig already handles quantization at the top-level hf_config.
+        # Clear it here so EPMoE doesn't receive a raw dict.
+        if isinstance(getattr(self.text_config, "quantization_config", None), dict):
+            self.text_config.quantization_config = None
 
         self.model = KimiDeepseekV3Model(self.text_config, mesh=mesh, dtype=self.dtype)
 
@@ -364,3 +372,4 @@ class KimiK25ForConditionalGeneration(nnx.Module):
 
         return mappings
 
+EntryClass = KimiK25ForConditionalGeneration
