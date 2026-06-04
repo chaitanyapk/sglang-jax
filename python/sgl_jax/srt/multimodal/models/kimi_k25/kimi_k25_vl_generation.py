@@ -95,6 +95,13 @@ class KimiK25ForConditionalGeneration(nnx.Module):
         self.dtype = dtype or jnp.bfloat16
         self.mesh = mesh
 
+        # TODO: Validate if any other fix can make it work smoothly
+        # text_config.quantization_config may be a raw dict from the JSON.
+        # ModelConfig already handles quantization at the top-level hf_config.
+        # Clear it here so EPMoE doesn't receive a raw dict.
+        if isinstance(getattr(self.text_config, "quantization_config", None), dict):
+            self.text_config.quantization_config = None
+
         self.model = KimiDeepseekV3Model(self.text_config, mesh=mesh, dtype=self.dtype)
 
         if not getattr(self.text_config, "tie_word_embeddings", False):
@@ -365,3 +372,4 @@ class KimiK25ForConditionalGeneration(nnx.Module):
 
         return mappings
 
+EntryClass = KimiK25ForConditionalGeneration

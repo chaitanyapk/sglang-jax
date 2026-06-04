@@ -99,6 +99,7 @@ class Stage:
             )
         else:
             # this parallelism setting is accord to stage config
+            print(f"Device count: {num_devices}, {device_kind}")
             self.mesh = create_device_mesh(
                 ici_parallelism=[-1, num_devices],
                 dcn_parallelism=[1, 1],
@@ -256,7 +257,7 @@ def get_model_class(name: str):
         return MiMoAudioForCausalLM
     elif name == "Kimi_K25_VisionModel":
         return Kimi_K25_VisionModel
-    elif name == "KimiK25ForConditionalGeneration"
+    elif name == "KimiK25ForConditionalGeneration":
         return KimiK25ForConditionalGeneration
     else:
         raise ValueError(f"Unknown model name: {name}")

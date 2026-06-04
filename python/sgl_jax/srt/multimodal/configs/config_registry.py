@@ -11,6 +11,7 @@ from sgl_jax.srt.multimodal.configs.mimo_audio.mimo_audio_backbone_config import
 )
 from sgl_jax.srt.multimodal.configs.mimo_audio.mimo_audio_config import MiMoAudioConfig
 from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import KimiK25ModelVitConfig
+from sgl_jax.srt.multimodal.configs.multimodal_base_config import MultiModalModelConfigs
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
@@ -60,6 +61,43 @@ _QWEN_VL_VISION_LIST_FIELDS = {
     "fullatt_block_indexes",
 }
 
+_KIMI_VL_VISION_KEY_MAP = {
+    "init_pos_emb_height": "init_pos_emb_height",
+    "init_pos_emb_time": "init_pos_emb_time",
+    "init_pos_emb_width": "init_pos_emb_width",
+    "merge_kernel_size": "merge_kernel_size",
+    "merge_type": "merge_type",
+    "mm_hidden_size": "mm_hidden_size",
+    "mm_projector_type": "mm_projector_type",
+    "patch_size": "patch_size",
+    "pos_emb_type": "pos_emb_type",
+    "projector_hidden_act": "projector_hidden_act",
+    "projector_ln_eps": "projector_ln_eps",
+    "text_hidden_size": "text_hidden_size",
+    "video_attn_type": "video_attn_type",
+    "vt_hidden_size": "vt_hidden_size",
+    "vt_intermediate_size": "vt_intermediate_size",
+    "vt_num_attention_heads": "vt_num_attention_heads",
+    "vt_num_hidden_layers": "vt_num_hidden_layers",
+}
+_KIMI_VL_VISION_INT_FIELDS = {
+    "init_pos_emb_height",
+    "init_pos_emb_time",
+    "init_pos_emb_width",
+    "mm_hidden_size",
+    "patch_size",
+    "text_hidden_size",
+    "vt_hidden_size",
+    "vt_intermediate_size",
+    "vt_num_attention_heads",
+    "vt_num_hidden_layers",
+}
+_KIMI_VL_VISION_FLOAT_FIELDS = {
+    "projector_ln_eps",
+}
+_KIMI_VL_VISION_LIST_FIELDS = {
+    "merge_kernel_size",
+}
 
 def _load_local_config_dict(model_path: str) -> dict | None:
     if not isinstance(model_path, str):
@@ -73,6 +111,39 @@ def _load_local_config_dict(model_path: str) -> dict | None:
     except Exception as exc:
         logger.warning("Failed to read config.json from %s: %s", config_path, exc)
         return None
+
+def _apply_kimi_vl_vision_overrides(
+        config: KimiK25ModelVitConfig, model_path: str
+) -> KimiK25ModelVitConfig:
+    config_dict = _load_local_config_dict(model_path)
+    if not config_dict:
+        return config
+
+    vision_cfg = config_dict.get("vision_config")
+    if not isinstance(vision_cfg, dict):
+        return config
+
+    updated_fields: set[str] = set()
+    for src_key, dst_attr in _KIMI_VL_VISION_KEY_MAP.items():
+        if src_key not in vision_cfg:
+            continue
+
+        value = vision_cfg[src_key]
+        if dst_attr in _KIMI_VL_VISION_INT_FIELDS:
+            with contextlib.suppress(Exception):
+                value = int(value)
+        elif dst_attr in _KIMI_VL_VISION_FLOAT_FIELDS:
+            with contextlib.suppress(Exception):
+                value = float(value)
+        elif dst_attr in _KIMI_VL_VISION_LIST_FIELDS:
+            with contextlib.suppress(Exception):
+                value = list(value)
+        setattr(config, dst_attr, value)
+        updated_fields.add(dst_attr)
+
+    if updated_fields:
+        logger.info("Loaded Kimi vision config overrides from %s, %s", model_path, len(updated_fields))
+    return config
 
 
 def _apply_qwen_vl_vision_overrides(
@@ -168,7 +239,7 @@ class DiffusionConfigRegistry:
         ),
         # Wan2.2 T2V A14B (MoE)
         "Wan-AI/Wan2.2-T2V-A14B-Diffusers": lambda: WanModelConfig(
-            flow_shift=12.0,
+            low_shift=12.0,
             boundary_ratio=0.875,
             **DiffusionConfigRegistry._WAN_14B_ARCH,
         ),
@@ -376,6 +447,7 @@ class KimiVLConfigRegistry:
     _REGISTRY: dict[str, callable] = {
         "moonshotai/Kimi-K2.5": lambda: KimiK25ModelVitConfig(),
         "ananayarora/Kimi-K2.5-BF16": lambda: KimiK25ModelVitConfig(),
+        "/local/kimi": lambda: KimiK25ModelVitConfig(),
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first)
@@ -396,13 +468,13 @@ class KimiVLConfigRegistry:
         config_factory = cls._REGISTRY.get(model_name)
         if config_factory:
             logger.debug("Found exact KimiK25 config match for model '%s'", model_name)
-            return config_factory() # TODO: Handle the values overrides for KimiK2.5
+            return _apply_kimi_vl_vision_overrides(config_factory(), model_path)
 
         # Try matching with full model_path (for HF-style repo IDs)
         config_factory = cls._REGISTRY.get(model_path)
         if config_factory:
             logger.debug("Found KimiK25 config match for full model path '%s'", model_path)
-            return config_factory()
+            return _apply_kimi_vl_vision_overrides(config_factory(), model_path)
 
         # Try keyword pattern matching
         for keyword, factory in cls._KEYWORD_PATTERNS:
@@ -410,7 +482,7 @@ class KimiVLConfigRegistry:
                 logger.debug(
                     "Found KimiK2.5 config keyword match '%s' for model '%s'", keyword, model_name
                 )
-                return config_factory()
+                return _apply_kimi_vl_vision_overrides(config_factory(), model_path)
 
         # No match found
         available_models = list(cls._REGISTRY.keys())
@@ -521,7 +593,7 @@ def get_kimi_vl_config(model_path: str) -> KimiK25ModelVitConfig:
         model_path: The model path from server args.
 
     Returns:
-        A VAE config instance configured for the specified model.
+        A VIT config instance configured for the specified model.
     """
     return KimiVLConfigRegistry.get_config(model_path)
 
@@ -531,10 +603,28 @@ def get_qwen_vl_config(model_path: str) -> QwenVLModelVitConfig:
         model_path: The model path from server args.
 
     Returns:
-        A VAE config instance configured for the specified model.
+        A VIT config instance configured for the specified model.
     """
     return QwenVLConfigRegistry.get_config(model_path)
 
+def get_vl_config(model_class: type, model_path: str) -> MultiModalModelConfigs:
+    """Generic funtion to get the appropriate vl config.
+    Args:
+        model_class: The model class.
+        model_path: Path of the model from server args.
+
+    Returns:
+        A VIT config instance configured for specific model.
+    """
+
+    if model_class.__name__ == "Qwen2_5_VL_VisionModel":
+        return get_qwen_vl_config(model_path)
+    elif model_class.__name__ == "Kimi_K25_VisionModel":
+        return get_kimi_vl_config(model_path)
+    else:
+        raise ValueError(
+            f"No VL config found for model class '{model_class.__name__}'"
+        )
 
 class AudioConfigRegistry:
     """Registry that maps model names to their audio tokenizer configs."""

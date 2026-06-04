@@ -35,7 +35,7 @@ def tpool_patch_merger(
     outputs = []
     pre_sum = 0
 
-    for t, h, w in grid_thws.tolist():
+    for t, h, w in grid_thws:
         seq = x[pre_sum : pre_sum + t * h * w]
 
         kernel_height, kernel_width = merge_kernel_size
@@ -87,7 +87,7 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
     ) -> jax.Array:
 
         pos_embs = []
-        for t, h, w in grid_thws.tolist():
+        for t, h, w in grid_thws:
             assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.reshape(-1, self.weight.shape[-1])
@@ -154,7 +154,7 @@ class Rope2DPosEmbRepeated(nnx.Module):
 
         freqs_cis = self._precompute_freqs_cis()
 
-        shapes = grid_thws.tolist()
+        shapes = grid_thws
         assert all(
             1 <= h <= self.max_height and 1 <= 2 <= self.max_width for t, h, w in shapes
         ), (
@@ -213,6 +213,8 @@ class KimiK25VisionPatchEmbed(nnx.Module):
         )
 
     def __call__(self, x: jax.Array, grid_thws: jax.Array) -> jax.Array:
+        print(f"Model kimi patch pixels: {x.shape}")
+        print(f"Model kimi patch grid: {grid_thws}")
         x = jnp.transpose(x, (0, 2, 3, 1))
         x = self.proj(x)
 
@@ -388,10 +390,13 @@ class VisionTowerEncoder(nnx.Module):
     ) -> jax.Array:
 
         rope_freqs_cis = self.rope_2d._get_freqs_cis(grid_thws=grid_thws)
+        # TODO: Frame out the grid_thws as np arrays and calculations to CPU
+        import numpy as np
+        grid_thws = np.array(grid_thws)
 
         lengths = jnp.concatenate(
             (
-                jnp.zeros(1, dtype=grid_thws.dtype),
+                jnp.zeros(1, dtype=jnp.int32),
                 grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2],
             )
         )
@@ -483,7 +488,7 @@ class Kimi_K25_MultiModalProjector(nnx.Module):
             rngs=_rngs,
         )
 
-        self.act = nnx.GELU()
+        self.act = nnx.gelu
 
     def __call__(
         self,
@@ -523,14 +528,15 @@ class Kimi_K25_VisionModel(nnx.Module):
         '''Load model weights with JAX distributed loading support'''
 
         if not hasattr(self, "text_embed"):
-            self.text_embed = Embed(
-                num_embeddings=,
-                features=,
-                dtype=self.dtype,
-                param_dtype=self.dtype,
-                kernel_axes=(None, None),
-                mesh=self.mesh,
-            )
+            with jax.set_mesh(self.mesh):
+                self.text_embed = Embed(
+                    num_embeddings=model_config.vocab_size,
+                    features=model_config.text_hidden_size,
+                    dtype=self.dtype,
+                    param_dtype=self.dtype,
+                    kernel_axes=("tensor", None),
+                    mesh=self.mesh,
+                )
 
         loader = WeightLoader(
             model=self,
@@ -542,7 +548,7 @@ class Kimi_K25_VisionModel(nnx.Module):
         weight_mappings = self._create_kimi_k25_vision_tower_weight_mappings()
 
         if self.mesh is not None:
-            with self.mesh: # TODO: Understand this
+            with self.mesh:
                 loader.load_weights_from_safetensors(weight_mappings)
         else:
             loader.load_weights_from_safetensors(weight_mappings)
@@ -552,7 +558,7 @@ class Kimi_K25_VisionModel(nnx.Module):
     def _create_kimi_k25_vision_tower_weight_mappings(self) -> dict:
         mappings = {}
 
-        mappings["language_mode.model.embed_tokens.weight"] = WeightMapping(
+        mappings["language_model.model.embed_tokens.weight"] = WeightMapping(
             target_path="text_embed.embedding",
             sharding=(None, None),
             transpose=False,
@@ -582,6 +588,36 @@ class Kimi_K25_VisionModel(nnx.Module):
                 ),
                 "vision_tower.encoder.final_layernorm.bias": WeightMapping(
                     target_path="vision_tower.encoder.final_layernorm.bias",
+                    sharding=(None,),
+                    transpose=False,
+                ),
+                "mm_projector.pre_norm.bias": WeightMapping(
+                    target_path="mm_projector.pre_norm.bias",
+                    sharding=(None,),
+                    transpose=False,
+                ),
+                "mm_projector.pre_norm.weight": WeightMapping(
+                    target_path="mm_projector.pre_norm.scale",
+                    sharding=(None,),
+                    transpose=False,
+                ),
+                "mm_projector.proj.0.weight": WeightMapping(
+                    target_path=f"mm_projector.proj_0.kernel",
+                    sharding=(None,),
+                    transpose=False,
+                ),
+                "mm_projector.proj.0.bias": WeightMapping(
+                    target_path=f"mm_projector.proj_0.bias",
+                    sharding=(None,),
+                    transpose=False,
+                ),
+                "mm_projector.proj.2.weight": WeightMapping(
+                    target_path=f"mm_projector.proj_1.kernel",
+                    sharding=(None,),
+                    transpose=True,
+                ),
+                "mm_projector.proj.2.bias": WeightMapping(
+                    target_path=f"mm_projector.proj_1.bias",
                     sharding=(None,),
                     transpose=False,
                 ),

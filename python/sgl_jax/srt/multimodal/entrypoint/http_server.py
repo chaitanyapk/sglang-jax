@@ -302,9 +302,11 @@ async def chat_completions(obj: ChatCompletionRequest, request: Request):
     try:
         from sgl_jax.srt.entrypoints.http_server import _global_state
 
+        print(f"API object: {obj}")
         prompt, image_data, video_data, audio_data = _extract_openai_prompt(
             obj, _global_state.tokenizer_manager.tokenizer
         )
+        print(f"API extraction object: {prompt}, {image_data}")
         if not image_data and not video_data and not audio_data:
             try:
                 raw_body = await request.json()
@@ -540,10 +542,11 @@ def _execute_multimodal_server_warmup(
             ],
             "max_tokens": 3,
         }
-    elif "Kimi-K2.5" in server_args.model_path:
+    elif "kimi" in server_args.model_path.lower() or "Kimi-K2" in server_args.model_path:
+        print("sending the KIMI request")
         request_endpoint = "/v1/chat/completions"
         json_data = {
-            "model": "ananayarora/Kimi-K2.5-BF16", # Update with original moonshotai weights
+            "model": server_args.model_path,
             "messages": [
                 {
                     "role": "user",
@@ -620,7 +623,7 @@ def _execute_multimodal_server_warmup(
             headers=headers,
             timeout=600,
         )
-        assert res.status_code == 200, f"{res}"
+        assert res.status_code == 200, f"{res.status_code}: {res.text}"
     except Exception:
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
