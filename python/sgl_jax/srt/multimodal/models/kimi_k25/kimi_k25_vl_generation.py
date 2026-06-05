@@ -2,25 +2,25 @@ import logging
 
 import jax
 import jax.numpy as jnp
-from flax import nnx
 import numpy as np
+from flax import nnx
 
 from sgl_jax.srt.configs.model_config import AttentionArch, ModelConfig
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
 from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.layers.moe import create_moe_weights_mapping
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Model
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-
 
 logger = logging.getLogger(__name__)
 
 
 class KimiDeepseekV3Model(DeepseekV3Model):
-    
+
     def __init__(
         self,
         config,
@@ -65,7 +65,6 @@ class KimiDeepseekV3Model(DeepseekV3Model):
 
         hidden_states = self.norm(hidden_states)
         return hidden_states, layers_kv_fused, layers_topk_ids
-
 
 
 class KimiK25ForConditionalGeneration(nnx.Module):
@@ -363,4 +362,3 @@ class KimiK25ForConditionalGeneration(nnx.Module):
                     )
 
         return mappings
-

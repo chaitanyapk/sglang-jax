@@ -1,7 +1,8 @@
 # python/sgl_jax/srt/multimodal/configs/kimi/kimi_k25_config.py
 from dataclasses import dataclass
-import jax.numpy as jnp
+
 from sgl_jax.srt.multimodal.configs.multimodal_base_config import MultiModalModelConfigs
+
 
 @dataclass
 class KimiK25ModelVitConfig(MultiModalModelConfigs):
@@ -23,5 +24,5 @@ class KimiK25ModelVitConfig(MultiModalModelConfigs):
     vt_intermediate_size: int = 4304
     vt_num_attention_heads: int = 16
     vt_num_hidden_layers: int = 27
-    
+
     model_class: type | None = None

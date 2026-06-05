@@ -1,7 +1,6 @@
 import logging
 import math
 
-
 import jax
 import jax.experimental.pallas as pl
 import jax.numpy as jnp
@@ -10,13 +9,11 @@ from flax import nnx
 from jax.sharding import Mesh
 from transformers import modeling_flax_utils
 
-from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import (
     KimiK25ModelVitConfig,
 )
 from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds, flash_attention
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
-
 
 init_fn = nnx.initializers.uniform()
 logger = logging.getLogger(__name__)
@@ -40,22 +37,17 @@ def tpool_patch_merger(
         kernel_height, kernel_width = merge_kernel_size
         new_height, new_width = h // kernel_height, w // kernel_width
 
-        reshaped_seq = seq.reshape(
-            t, new_height, kernel_height, new_width, kernel_width, d_model
-        )
+        reshaped_seq = seq.reshape(t, new_height, kernel_height, new_width, kernel_width, d_model)
 
-        reshaped_seq = (
-            reshaped_seq.transpose(0, 1, 3, 2, 4, 5).mean(axis=0)
-        )
+        reshaped_seq = reshaped_seq.transpose(0, 1, 3, 2, 4, 5).mean(axis=0)
 
-        padded_seq = reshaped_seq.reshape(
-            new_height * new_width, kernel_height * kernel_width, -1
-        )
+        padded_seq = reshaped_seq.reshape(new_height * new_width, kernel_height * kernel_width, -1)
 
         outputs.append(padded_seq)
         pre_sum += t * h * w
 
     return outputs
+
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     assert embed_dim % 2 == 0
@@ -90,7 +82,7 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
         num_frames: int,
         dim: int,
         interpolation_mode: str = "bicubic",
-        rngs: nnx.Rngs = None,
+        rngs: nnx.Rngs | None = None,
     ) -> None:
         self.height = height
         self.width = width
@@ -98,19 +90,11 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
         self.dim = dim
         self.interpolation_mode = interpolation_mode
 
-        _rngs = rngs or nnx.Rngs(0) 
-        self.weight = nnx.Param(
-            nnx.initializers.normal()(_rngs.params(), (height, width, dim))
-        )
-        self.time_weight = jnp.array(
-            get_1d_sincos_pos_embed(self.dim, self.num_frames)
-        )[:, None, :]
+        _rngs = rngs or nnx.Rngs(0)
+        self.weight = nnx.Param(nnx.initializers.normal()(_rngs.params(), (height, width, dim)))
+        self.time_weight = jnp.array(get_1d_sincos_pos_embed(self.dim, self.num_frames))[:, None, :]
 
-    def __call__(
-        self,
-        x: jax.Array,
-        grid_thws: jax.Array
-    ) -> jax.Array:
+    def __call__(self, x: jax.Array, grid_thws: jax.Array) -> jax.Array:
 
         pos_embs = []
         for t, h, w in grid_thws.tolist():
@@ -119,9 +103,7 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
                 pos_emb_2d = self.weight.reshape(-1, self.weight.shape[-1])
             else:
                 pos_emb_2d = jax.image.resize(
-                    self.weight.value,
-                    shape=(h, w, self.dim),
-                    method="bicubic"
+                    self.weight.value, shape=(h, w, self.dim), method="bicubic"
                 ).reshape(-1, self.dim)
 
             if t == 1:
@@ -136,6 +118,7 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
         out = x + jnp.concatenate(pos_embs, axis=0)
         return out
 
+
 class Rope2DPosEmbRepeated(nnx.Module):
 
     def __init__(
@@ -143,7 +126,7 @@ class Rope2DPosEmbRepeated(nnx.Module):
         dim: int,
         max_height: int,
         max_width: int,
-        theta_base: int = 10000, # Verify this value with config
+        theta_base: int = 10000,  # Verify this value with config
     ):
         self.dim = dim
         assert self.dim % 4 == 0, "dim must be divisible by 4"
@@ -158,9 +141,7 @@ class Rope2DPosEmbRepeated(nnx.Module):
         x_pos = flat_pos % self.max_width
         y_pos = flat_pos // self.max_width
 
-        dim_range = (
-            jnp.arange(0, self.dim, 4)[: (self.dim // 4)].astype(jnp.float32)
-        )
+        dim_range = jnp.arange(0, self.dim, 4)[: (self.dim // 4)].astype(jnp.float32)
 
         freqs = 1.0 / (self.theta_base ** (dim_range / self.dim))
         x_freqs = jnp.outer(x_pos, freqs).astype(jnp.float32)
@@ -185,9 +166,7 @@ class Rope2DPosEmbRepeated(nnx.Module):
         freqs_cis = self.freqs_cis
 
         shapes = grid_thws.tolist()
-        assert all(
-            1 <= h <= self.max_height and 1 <= w <= self.max_width for t, h, w in shapes
-        ), (
+        assert all(1 <= h <= self.max_height and 1 <= w <= self.max_width for t, h, w in shapes), (
             shapes,
             self.max_height,
             self.max_width,
@@ -197,8 +176,8 @@ class Rope2DPosEmbRepeated(nnx.Module):
             [
                 jnp.tile(freqs_cis[:, :h, :w].reshape(2, -1, self.dim // 2), (1, t, 1))
                 for t, h, w in shapes
-            ], 
-            axis=1
+            ],
+            axis=1,
         )
 
         return freqs_cis
@@ -208,9 +187,9 @@ class KimiK25VisionPatchEmbed(nnx.Module):
 
     def __init__(
         self,
-        rngs: nnx.Rngs = None,
+        rngs: nnx.Rngs | None = None,
         patch_size: int = 14,
-        in_channels: int = 3, # TODO: check which model config this corresponds to
+        in_channels: int = 3,  # TODO: check which model config this corresponds to
         pos_emb_height: int = 64,
         pos_emb_width: int = 64,
         pos_emb_time: int = 4,
@@ -224,10 +203,7 @@ class KimiK25VisionPatchEmbed(nnx.Module):
 
         if pos_emb_type == "divided_fixed":
             self.pos_emb = Learnable2DInterPosEmbDivided_fixed(
-                height=pos_emb_height,
-                width=pos_emb_width,
-                num_frames=pos_emb_time,
-                dim=hidden_size
+                height=pos_emb_height, width=pos_emb_width, num_frames=pos_emb_time, dim=hidden_size
             )
         else:
             raise NotImplementedError(f"No support for pos_emb_type: {pos_emb_type}")
@@ -271,7 +247,7 @@ class KimiK25VisionAttention(nnx.Module):
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype,
         mesh: Mesh,
-        rngs: nnx.Rngs = None,
+        rngs: nnx.Rngs | None = None,
     ):
         assert mesh is not None, "KimiK25VisionAttention requires a sharding Mesh"
         self.mesh = mesh
@@ -302,7 +278,12 @@ class KimiK25VisionAttention(nnx.Module):
         # Project to Q, K, V
         qkv = self.qkv_proj(hidden_states)
         q, k, v = jnp.split(qkv, 3, axis=-1)
-        jax.debug.print("--- VisionAttention Projected Q mean: {}, K mean: {}, V mean: {}", q.mean(), k.mean(), v.mean())
+        jax.debug.print(
+            "--- VisionAttention Projected Q mean: {}, K mean: {}, V mean: {}",
+            q.mean(),
+            k.mean(),
+            v.mean(),
+        )
 
         # Reshape: [S, D] -> [S, N, H_D]
         q = q.reshape(sum_seq_len, self.num_heads, self.head_dim)
@@ -316,35 +297,40 @@ class KimiK25VisionAttention(nnx.Module):
         jax.debug.print("--- VisionAttention after RoPE Q mean: {}, K mean: {}", q.mean(), k.mean())
 
         # TPU Path: Segmented TPU Pallas FlashAttention
-        
+
         # 1. Pad sequence length to multiple of 256
         align_seq_len = align_to(sum_seq_len, 256)
-        
+
         pad_q = q
         pad_k = k
         pad_v = v
-        
+
         segment_ids = None
-        
+
         if sum_seq_len != align_seq_len:
             pad_q = jnp.pad(q, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
             pad_k = jnp.pad(k, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
             pad_v = jnp.pad(v, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
-            
+
             # Generate segment IDs: valid tokens have positive indices, padding has 0
             indices = jnp.arange(sum_seq_len)
             item_ids = jnp.sum(indices[:, None] >= cu_seqlens[1:][None, :], axis=-1) + 1
-            
+
             seg_q = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
             seg_kv = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
-            
+
             segment_ids = SegmentIds(q=seg_q[None, :], kv=seg_kv[None, :])
 
         # Reshape to batch-format expected by Pallas kernel: [B=1, H, S, H_D]
         pad_q = jnp.transpose(pad_q, (1, 0, 2))[None, ...]
         pad_k = jnp.transpose(pad_k, (1, 0, 2))[None, ...]
         pad_v = jnp.transpose(pad_v, (1, 0, 2))[None, ...]
-        jax.debug.print("--- VisionAttention pad_q shape: {}, pad_k shape: {}, pad_v shape: {}", pad_q.shape, pad_k.shape, pad_v.shape)
+        jax.debug.print(
+            "--- VisionAttention pad_q shape: {}, pad_k shape: {}, pad_v shape: {}",
+            pad_q.shape,
+            pad_k.shape,
+            pad_v.shape,
+        )
 
         # Execute TPU Pallas FlashAttention kernel
         def local_flash_attention(q, k, v, segment_ids):
@@ -361,10 +347,7 @@ class KimiK25VisionAttention(nnx.Module):
             jax.sharding.PartitionSpec(None, None, None, None),
             jax.sharding.PartitionSpec(None, None, None, None),
             jax.sharding.PartitionSpec(None, None, None, None),
-            SegmentIds(
-                q=jax.sharding.PartitionSpec(None, None),
-                kv=jax.sharding.PartitionSpec(None, None)
-            ) if segment_ids is not None else None
+            jax.sharding.PartitionSpec() if segment_ids is not None else None,
         )
 
         output = jax.shard_map(
@@ -374,7 +357,9 @@ class KimiK25VisionAttention(nnx.Module):
             out_specs=jax.sharding.PartitionSpec(None, None, None, None),
             check_vma=False,
         )(pad_q, pad_k, pad_v, segment_ids)
-        jax.debug.print("--- VisionAttention output (before transpose/reshape) mean: {}", output.mean())
+        jax.debug.print(
+            "--- VisionAttention output (before transpose/reshape) mean: {}", output.mean()
+        )
 
         # Reshape back: [B=1, H, S, H_D] -> [S, H, H_D] -> slice back to sum_seq_len -> [S, D]
         output = jnp.transpose(output[0], (1, 0, 2))
@@ -384,15 +369,14 @@ class KimiK25VisionAttention(nnx.Module):
         return output
 
 
-
 class KimiK25VisionMLP(nnx.Module):
 
     def __init__(
         self,
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype,
-        mesh: Mesh = None,
-        rngs: nnx.Rngs = None,
+        mesh: Mesh | None = None,
+        rngs: nnx.Rngs | None = None,
     ):
         in_features = config.vt_hidden_size
         intermediate_size = config.vt_intermediate_size
@@ -417,10 +401,12 @@ class KimiK25VisionMLP(nnx.Module):
             rngs=_rngs,
         )
 
-        self.act_fn = modeling_flax_utils.ACT2FN[config.projector_hidden_act] # TODO: Verify if this is the right param
+        self.act_fn = modeling_flax_utils.ACT2FN[
+            config.projector_hidden_act
+        ]  # TODO: Verify if this is the right param
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        up = self.act_fn(self.up_proj(x))
+        up = self.act_fn(self.up_proj(x))  # type: ignore[operator]
         return self.down_proj(up)
 
 
@@ -430,10 +416,11 @@ class KimiK25VisionBlock(nnx.Module):
         self,
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype,
-        mesh: Mesh = None,
+        mesh: Mesh | None = None,
         norm_eps: float = 1e-6,
-        rngs: nnx.Rngs = None,
+        rngs: nnx.Rngs | None = None,
     ):
+        assert mesh is not None, "KimiK25VisionBlock requires a sharding Mesh"
         self.attn = KimiK25VisionAttention(config, dtype, mesh, rngs)
         self.mlp = KimiK25VisionMLP(config, dtype, mesh, rngs)
 
@@ -449,11 +436,11 @@ class KimiK25VisionBlock(nnx.Module):
         self.post_norm = nnx.LayerNorm(config.vt_hidden_size, param_dtype=dtype, rngs=_rngs)
 
     def __call__(
-        self, 
+        self,
         hidden_states: jax.Array,
         cu_seqlens: jax.Array,
-        max_seqlen: int,
-        rope_freqs_cis: jax.Array
+        max_seqlen: jax.Array,
+        rope_freqs_cis: jax.Array,
     ):
         # 1. Attention Stage (Norm -> Attn -> WO projection -> Residual)
         residual = hidden_states
@@ -463,7 +450,7 @@ class KimiK25VisionBlock(nnx.Module):
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
         )
-        hidden_states = self.proj(hidden_states) # WO projection
+        hidden_states = self.proj(hidden_states)  # WO projection
         hidden_states = residual + hidden_states
 
         # 2. MLP Stage (Norm -> MLP -> Residual)
@@ -481,17 +468,21 @@ class VisionTowerEncoder(nnx.Module):
         self,
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype,
-        mesh: Mesh = None,
+        mesh: Mesh | None = None,
         norm_eps: float = 1e-6,
-        rngs: nnx.Rngs = None,
+        rngs: nnx.Rngs | None = None,
         video_attn_type: str = "spatial_temporal",
     ):
         self.config = config
         self.dtype = dtype
 
-        assert (video_attn_type == "spatial_temporal"), f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+        assert (
+            video_attn_type == "spatial_temporal"
+        ), f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
 
-        self.rope_2d = Rope2DPosEmbRepeated(config.vt_hidden_size // config.vt_num_attention_heads, 512, 512) 
+        self.rope_2d = Rope2DPosEmbRepeated(
+            config.vt_hidden_size // config.vt_num_attention_heads, 512, 512
+        )
 
         self.blocks = nnx.List(
             [
@@ -538,13 +529,13 @@ class VisionTowerEncoder(nnx.Module):
 
 
 class VisionTower(nnx.Module):
-    
+
     def __init__(
         self,
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype,
-        rngs: nnx.Rngs = None,
-        mesh: Mesh = None,
+        rngs: nnx.Rngs | None = None,
+        mesh: Mesh | None = None,
         norm_eps: float = 1e-6,
     ):
         self.config = config
@@ -556,12 +547,13 @@ class VisionTower(nnx.Module):
             rngs,
             config.patch_size,
             3,
-            config.init_pos_emb_height, 
+            config.init_pos_emb_height,
             config.init_pos_emb_width,
             config.init_pos_emb_time,
             config.pos_emb_type,
-            config.vt_hidden_size, 
-            dtype)
+            config.vt_hidden_size,
+            dtype,
+        )
 
         self.encoder = VisionTowerEncoder(config, dtype, mesh, norm_eps, rngs)
 
@@ -569,7 +561,7 @@ class VisionTower(nnx.Module):
         self,
         pixel_values: jax.Array,
         grid_thws: jax.Array,
-    ) -> jax.Array:
+    ) -> list[jax.Array]:
 
         # TODO: Add assertions
         hidden_states = self.patch_embed(pixel_values, grid_thws)
@@ -588,7 +580,7 @@ class Kimi_K25_MultiModalProjector(nnx.Module):
         self,
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype,
-        rngs: nnx.Rngs = None,
+        rngs: nnx.Rngs | None = None,
     ):
         merge_h, merge_w = config.merge_kernel_size
         self.hidden_size = config.vt_hidden_size * merge_h * merge_w
@@ -624,18 +616,17 @@ class Kimi_K25_MultiModalProjector(nnx.Module):
         return self.proj_1(hidden_states)
 
 
-
 class Kimi_K25_VisionModel(nnx.Module):
-    '''
+    """
     Placeholder model class for the ViT stage.
-    '''
+    """
 
     def __init__(
         self,
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
-        mesh: Mesh = None
+        rngs: nnx.Rngs | None = None,
+        mesh: Mesh | None = None,
     ) -> None:
 
         self.config = config
@@ -646,21 +637,20 @@ class Kimi_K25_VisionModel(nnx.Module):
 
         logger.info("Kimi K2.5 Vision Model initialized with dtype %s", dtype)
 
-
     def load_weights(self, model_config: KimiK25ModelVitConfig) -> None:
-        '''Load model weights with JAX distributed loading support'''
+        """Load model weights with JAX distributed loading support"""
 
         loader = WeightLoader(
             model=self,
-            model_config=model_config,
-            mesh=self.mesh,
+            model_config=model_config,  # type: ignore[arg-type]
+            mesh=self.mesh,  # type: ignore[arg-type]
             dtype=self.dtype,
         )
 
         weight_mappings = self._create_kimi_k25_vision_tower_weight_mappings()
 
         if self.mesh is not None:
-            with self.mesh: # TODO: Understand this
+            with self.mesh:  # TODO: Understand this
                 loader.load_weights_from_safetensors(weight_mappings)
         else:
             loader.load_weights_from_safetensors(weight_mappings)
@@ -697,7 +687,8 @@ class Kimi_K25_VisionModel(nnx.Module):
                     sharding=(None,),
                     transpose=False,
                 ),
-            })
+            }
+        )
 
         for layer_idx in range(self.config.vt_num_hidden_layers):
             vision_layer_mappings = self._create_vision_layer_mappings(layer_idx)
