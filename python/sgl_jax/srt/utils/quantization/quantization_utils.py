@@ -19,6 +19,23 @@ from sgl_jax.srt.configs.quantization_config import (
 logger = logging.getLogger(__name__)
 
 
+def _is_layer_ignored(dot_path: str, ignored_layers: list[str]) -> bool:
+    if not ignored_layers:
+        return False
+    for ignored in ignored_layers:
+        if ignored.startswith("re:"):
+            pattern = ignored[3:]
+            try:
+                if re.match(pattern, dot_path) or re.search(pattern, dot_path):
+                    return True
+            except re.error:
+                logger.warning("Invalid regex pattern in ignore list: %s", pattern)
+        else:
+            if dot_path == ignored or dot_path.endswith(f".{ignored}"):
+                return True
+    return False
+
+
 def _get_block_reshape_sharding(
     tensor: jax.Array,
     quantized_axes: list[int],
@@ -173,10 +190,7 @@ def apply_linear_quantization(
                 if isinstance(attr_value, LinearBase):
                     # Check if this path matches any rule
                     dot_path = child_path.replace("/", ".")
-                    if any(
-                        dot_path == ignored or dot_path.endswith(f".{ignored}")
-                        for ignored in ignored_layers
-                    ):
+                    if _is_layer_ignored(dot_path, ignored_layers):
                         logger.info("Skipping %s - in ignored_layers", dot_path)
                         continue
 
@@ -248,15 +262,13 @@ def apply_moe_quantization(
     ignored_layers = quant_config.ignored_layers or []
 
     def _is_ignored(log_path: str) -> bool:
-        if not ignored_layers:
-            return False
         # Walker emits paths like "model/layers[5]/mlp" — normalize to dot
         # form ("model.layers.5.mlp") so it can be compared against HF
         # ignore entries which use dot notation.
         normalized = log_path.replace("/", ".")
         normalized = re.sub(r"\.\[(\d+)\]", r".\1", normalized)
         normalized = re.sub(r"\[(\d+)\]", r".\1", normalized)
-        return any(normalized == ig or normalized.endswith(f".{ig}") for ig in ignored_layers)
+        return _is_layer_ignored(normalized, ignored_layers)
 
     def _quantize_moe_recursive(obj, path: str = "", visited=None):
         if visited is None:

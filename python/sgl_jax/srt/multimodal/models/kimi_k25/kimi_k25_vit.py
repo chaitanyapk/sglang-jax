@@ -1,10 +1,9 @@
 import logging
 import math
-from collections.abc import Callable
-from functools import partial
-from typing import Literal, TypedDict
+
 
 import jax
+import jax.experimental.pallas as pl
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
@@ -15,7 +14,7 @@ from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import (
     KimiK25ModelVitConfig,
 )
-
+from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds, flash_attention
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 
@@ -58,6 +57,30 @@ def tpool_patch_merger(
 
     return outputs
 
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float32)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
+
+    emb_sin = np.sin(out)  # (M, D/2)
+    emb_cos = np.cos(out)  # (M, D/2)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
+
+
+def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
+    grid_t = np.arange(t_size, dtype=np.float32)
+    pos_embed = get_1d_sincos_pos_embed_from_grid(embed_dim, grid_t)
+    if cls_token:
+        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
+    return pos_embed
+
+
 class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
 
     def __init__(
@@ -79,6 +102,9 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
         self.weight = nnx.Param(
             nnx.initializers.normal()(_rngs.params(), (height, width, dim))
         )
+        self.time_weight = jnp.array(
+            get_1d_sincos_pos_embed(self.dim, self.num_frames)
+        )[:, None, :]
 
     def __call__(
         self,
@@ -92,15 +118,17 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.reshape(-1, self.weight.shape[-1])
             else:
-                pos_emb_2d = self.weight[:h, :w, :].reshape(-1, self.weight.shape[-1])
-                
-            # TODO: Implement interpolation mode
+                pos_emb_2d = jax.image.resize(
+                    self.weight.value,
+                    shape=(h, w, self.dim),
+                    method="bicubic"
+                ).reshape(-1, self.dim)
 
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
                 pos_emb_3d = (
-                    jnp.expand_dims(pos_emb_2d, axis=0).repeat(t, 1, 1) # Add self.time_weight[0:t] for temporal axis
+                    jnp.expand_dims(pos_emb_2d, axis=0).repeat(t, axis=0) + self.time_weight[0:t]
                 )
 
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
@@ -122,12 +150,13 @@ class Rope2DPosEmbRepeated(nnx.Module):
         self.max_height = max_height
         self.max_width = max_width
         self.theta_base = theta_base
+        self.freqs_cis = self._precompute_freqs_cis()
 
-    def _precompute_freqs_cis(self) -> None:
+    def _precompute_freqs_cis(self) -> jax.Array:
         N = self.max_height * self.max_width
         flat_pos = jnp.arange(0, N).astype(jnp.float32)
         x_pos = flat_pos % self.max_width
-        y_pos = flat_pos % self.max_height
+        y_pos = flat_pos // self.max_width
 
         dim_range = (
             jnp.arange(0, self.dim, 4)[: (self.dim // 4)].astype(jnp.float32)
@@ -137,38 +166,39 @@ class Rope2DPosEmbRepeated(nnx.Module):
         x_freqs = jnp.outer(x_pos, freqs).astype(jnp.float32)
         y_freqs = jnp.outer(y_pos, freqs).astype(jnp.float32)
 
-        x_cis = jnp.exp(1j * x_freqs)
-        y_cis = jnp.exp(1j * y_freqs)
+        cos_x = jnp.cos(x_freqs)
+        sin_x = jnp.sin(x_freqs)
+        cos_y = jnp.cos(y_freqs)
+        sin_y = jnp.sin(y_freqs)
 
-        freqs_cis = jnp.concatenate(
-            [jnp.expand_dims(x_cis, axis=-1), jnp.expand_dims(y_cis, axis=-1)], axis=-1
-        )
+        cos_emb = jnp.stack([cos_x, cos_y], axis=-1).reshape(N, -1)
+        sin_emb = jnp.stack([sin_x, sin_y], axis=-1).reshape(N, -1)
 
-        freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
+        freqs_cis = jnp.stack([cos_emb, sin_emb], axis=0)
+        freqs_cis = freqs_cis.reshape(2, self.max_height, self.max_width, -1)
         return freqs_cis
 
     def _get_freqs_cis(
         self,
         grid_thws: jax.Array,
     ) -> jax.Array:
-
-        freqs_cis = self._precompute_freqs_cis()
+        freqs_cis = self.freqs_cis
 
         shapes = grid_thws.tolist()
         assert all(
-            1 <= h <= self.max_height and 1 <= 2 <= self.max_width for t, h, w in shapes
+            1 <= h <= self.max_height and 1 <= w <= self.max_width for t, h, w in shapes
         ), (
             shapes,
             self.max_height,
-            self.max_widht,
+            self.max_width,
         )
 
         freqs_cis = jnp.concatenate(
             [
-                freqs_cis[:h, :w].reshape(-1, self.dim // 2).repeat(t, 1)
+                jnp.tile(freqs_cis[:, :h, :w].reshape(2, -1, self.dim // 2), (1, t, 1))
                 for t, h, w in shapes
             ], 
-            axis=0
+            axis=1
         )
 
         return freqs_cis
@@ -223,21 +253,38 @@ class KimiK25VisionPatchEmbed(nnx.Module):
         return self.pos_emb(x, grid_thws)
 
 
+def align_to(x, a):
+    return pl.cdiv(x, a) * a
+
+
+def apply_2d_rope(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
+    x_real = x[..., 0::2]
+    x_imag = x[..., 1::2]
+    x_rot_real = x_real * cos[:, None, :] - x_imag * sin[:, None, :]
+    x_rot_imag = x_real * sin[:, None, :] + x_imag * cos[:, None, :]
+    return jnp.stack([x_rot_real, x_rot_imag], axis=-1).reshape(x.shape)
+
+
 class KimiK25VisionAttention(nnx.Module):
     def __init__(
         self,
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype,
-        mesh: Mesh = None,
+        mesh: Mesh,
         rngs: nnx.Rngs = None,
     ):
+        assert mesh is not None, "KimiK25VisionAttention requires a sharding Mesh"
         self.mesh = mesh
+        self.hidden_size = config.vt_hidden_size
+        self.num_heads = config.vt_num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.scale = 1.0 / math.sqrt(self.head_dim)
 
         _rngs = rngs or nnx.Rngs(0)
 
         self.qkv_proj = nnx.Linear(
-            config.vt_hidden_size,
-            3 * config.vt_hidden_size,
+            self.hidden_size,
+            3 * self.hidden_size,
             use_bias=True,
             param_dtype=dtype,
             rngs=_rngs,
@@ -248,9 +295,93 @@ class KimiK25VisionAttention(nnx.Module):
         hidden_states: jax.Array,
         cu_seqlens: jax.Array,
         position_embeddings: jax.Array,
-    ):
-        # TODO: Implement the attention layer
-        return hidden_states
+    ) -> jax.Array:
+        sum_seq_len, D = hidden_states.shape
+        jax.debug.print("--- VisionAttention Input hidden_states mean: {}", hidden_states.mean())
+
+        # Project to Q, K, V
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+        jax.debug.print("--- VisionAttention Projected Q mean: {}, K mean: {}, V mean: {}", q.mean(), k.mean(), v.mean())
+
+        # Reshape: [S, D] -> [S, N, H_D]
+        q = q.reshape(sum_seq_len, self.num_heads, self.head_dim)
+        k = k.reshape(sum_seq_len, self.num_heads, self.head_dim)
+        v = v.reshape(sum_seq_len, self.num_heads, self.head_dim)
+
+        # Apply 2D RoPE
+        cos_emb, sin_emb = position_embeddings[0], position_embeddings[1]
+        q = apply_2d_rope(q, cos_emb, sin_emb)
+        k = apply_2d_rope(k, cos_emb, sin_emb)
+        jax.debug.print("--- VisionAttention after RoPE Q mean: {}, K mean: {}", q.mean(), k.mean())
+
+        # TPU Path: Segmented TPU Pallas FlashAttention
+        
+        # 1. Pad sequence length to multiple of 256
+        align_seq_len = align_to(sum_seq_len, 256)
+        
+        pad_q = q
+        pad_k = k
+        pad_v = v
+        
+        segment_ids = None
+        
+        if sum_seq_len != align_seq_len:
+            pad_q = jnp.pad(q, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
+            pad_k = jnp.pad(k, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
+            pad_v = jnp.pad(v, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
+            
+            # Generate segment IDs: valid tokens have positive indices, padding has 0
+            indices = jnp.arange(sum_seq_len)
+            item_ids = jnp.sum(indices[:, None] >= cu_seqlens[1:][None, :], axis=-1) + 1
+            
+            seg_q = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
+            seg_kv = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
+            
+            segment_ids = SegmentIds(q=seg_q[None, :], kv=seg_kv[None, :])
+
+        # Reshape to batch-format expected by Pallas kernel: [B=1, H, S, H_D]
+        pad_q = jnp.transpose(pad_q, (1, 0, 2))[None, ...]
+        pad_k = jnp.transpose(pad_k, (1, 0, 2))[None, ...]
+        pad_v = jnp.transpose(pad_v, (1, 0, 2))[None, ...]
+        jax.debug.print("--- VisionAttention pad_q shape: {}, pad_k shape: {}, pad_v shape: {}", pad_q.shape, pad_k.shape, pad_v.shape)
+
+        # Execute TPU Pallas FlashAttention kernel
+        def local_flash_attention(q, k, v, segment_ids):
+            return flash_attention(
+                q,
+                k,
+                v,
+                segment_ids=segment_ids,
+                causal=False,
+                sm_scale=self.scale,
+            )
+
+        in_specs = (
+            jax.sharding.PartitionSpec(None, None, None, None),
+            jax.sharding.PartitionSpec(None, None, None, None),
+            jax.sharding.PartitionSpec(None, None, None, None),
+            SegmentIds(
+                q=jax.sharding.PartitionSpec(None, None),
+                kv=jax.sharding.PartitionSpec(None, None)
+            ) if segment_ids is not None else None
+        )
+
+        output = jax.shard_map(
+            local_flash_attention,
+            mesh=self.mesh,
+            in_specs=in_specs,
+            out_specs=jax.sharding.PartitionSpec(None, None, None, None),
+            check_vma=False,
+        )(pad_q, pad_k, pad_v, segment_ids)
+        jax.debug.print("--- VisionAttention output (before transpose/reshape) mean: {}", output.mean())
+
+        # Reshape back: [B=1, H, S, H_D] -> [S, H, H_D] -> slice back to sum_seq_len -> [S, D]
+        output = jnp.transpose(output[0], (1, 0, 2))
+        output = output[:sum_seq_len, :, :].reshape(sum_seq_len, D)
+        jax.debug.print("--- VisionAttention output (final) mean: {}", output.mean())
+
+        return output
 
 
 
@@ -303,22 +434,18 @@ class KimiK25VisionBlock(nnx.Module):
         norm_eps: float = 1e-6,
         rngs: nnx.Rngs = None,
     ):
-
-        self.attn = KimiK25VisionAttention(config, dtype, mesh, rngs) # TODO: Investigate the working of the Attention with RoPE
-
+        self.attn = KimiK25VisionAttention(config, dtype, mesh, rngs)
         self.mlp = KimiK25VisionMLP(config, dtype, mesh, rngs)
 
         _rngs = rngs or nnx.Rngs(0)
         self.pre_norm = nnx.LayerNorm(config.vt_hidden_size, param_dtype=dtype, rngs=_rngs)
-
-        self.proj = nnx.Linear( # TODO: Add activation function too
+        self.proj = nnx.Linear(
             config.vt_hidden_size,
             config.vt_hidden_size,
             use_bias=True,
             param_dtype=dtype,
             rngs=_rngs,
         )
-
         self.post_norm = nnx.LayerNorm(config.vt_hidden_size, param_dtype=dtype, rngs=_rngs)
 
     def __call__(
@@ -328,20 +455,21 @@ class KimiK25VisionBlock(nnx.Module):
         max_seqlen: int,
         rope_freqs_cis: jax.Array
     ):
+        # 1. Attention Stage (Norm -> Attn -> WO projection -> Residual)
         residual = hidden_states
         hidden_states = self.pre_norm(hidden_states)
-
         hidden_states = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
         )
-
+        hidden_states = self.proj(hidden_states) # WO projection
         hidden_states = residual + hidden_states
 
+        # 2. MLP Stage (Norm -> MLP -> Residual)
         residual = hidden_states
         hidden_states = self.post_norm(hidden_states)
-        hidden_states = self.proj(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -452,6 +580,7 @@ class VisionTower(nnx.Module):
         )
 
         return hidden_states
+
 
 class Kimi_K25_MultiModalProjector(nnx.Module):
 
@@ -583,7 +712,7 @@ class Kimi_K25_VisionModel(nnx.Module):
             f"{prefix}.wqkv.weight": WeightMapping(
                 target_path=f"{prefix}.attn.qkv_proj.kernel",
                 sharding=(None,),
-                transpose=False,
+                transpose=True,
             ),
             f"{prefix}.wqkv.bias": WeightMapping(
                 target_path=f"{prefix}.attn.qkv_proj.bias",
@@ -593,7 +722,7 @@ class Kimi_K25_VisionModel(nnx.Module):
             f"{prefix}.wo.weight": WeightMapping(
                 target_path=f"{prefix}.proj.kernel",
                 sharding=(None,),
-                transpose=False,
+                transpose=True,
             ),
             f"{prefix}.wo.bias": WeightMapping(
                 target_path=f"{prefix}.proj.bias",
@@ -603,7 +732,7 @@ class Kimi_K25_VisionModel(nnx.Module):
             f"{prefix}.mlp.fc0.weight": WeightMapping(
                 target_path=f"{prefix}.mlp.up_proj.kernel",
                 sharding=(None,),
-                transpose=False,
+                transpose=True,
             ),
             f"{prefix}.mlp.fc0.bias": WeightMapping(
                 target_path=f"{prefix}.mlp.up_proj.bias",
@@ -613,7 +742,7 @@ class Kimi_K25_VisionModel(nnx.Module):
             f"{prefix}.mlp.fc1.weight": WeightMapping(
                 target_path=f"{prefix}.mlp.down_proj.kernel",
                 sharding=(None,),
-                transpose=False,
+                transpose=True,
             ),
             f"{prefix}.mlp.fc1.bias": WeightMapping(
                 target_path=f"{prefix}.mlp.down_proj.bias",
