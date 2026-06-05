@@ -527,5 +527,171 @@ def test_ignored_layers_exact_match_does_not_overmatch():
     assert isinstance(model.self_attn.o_proj, QuantizedLinear)
 
 
+@pytest.mark.parametrize(
+    "dtype_str,expected_jax_dtype",
+    [
+        ("int4", jnp.int4),
+        ("uint4", jnp.uint4),
+        ("float4_e2m1fn", jnp.float4_e2m1fn),
+    ],
+)
+def test_4bit_quantization_dtypes(dtype_str, expected_jax_dtype):
+    class DummyModel(nnx.Module):
+        def __init__(self, mesh):
+            self.proj = LinearBase(
+                input_size=256,
+                output_size=512,
+                use_bias=False,
+                mesh=mesh,
+                kernel_axes=(None, None),
+                params_dtype=jnp.bfloat16,
+                scope_name="proj",
+            )
+
+    class FakeModelConfig:
+        pass
+
+    model_config = FakeModelConfig()
+    model_config.quantization_config = type(
+        "FakeQuantConfig",
+        (),
+        {
+            "get_linear_rules": staticmethod(
+                lambda: [
+                    {
+                        "module_path": ".*",
+                        "weight_dtype": dtype_str,
+                        "activation_dtype": None,
+                        "weight_block_size": None,
+                    }
+                ]
+            ),
+            "ignored_layers": None,
+            "weight_block_size": None,
+        },
+    )()
+
+    mesh = _create_single_device_mesh()
+    with jax.set_mesh(mesh):
+        model = DummyModel(mesh)
+
+    apply_linear_quantization(model_config, model, is_static_input=False)
+
+    assert isinstance(model.proj, QuantizedLinear)
+    assert model.proj.weight_q.value.dtype == expected_jax_dtype
+
+
+def test_4bit_weight_loading_unpacking():
+    import tempfile
+    import os
+    from safetensors.flax import save_file
+    from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+
+    # Dimensions
+    in_dim = 128
+    out_dim = 64
+
+    class DummyModel(nnx.Module):
+        def __init__(self, mesh):
+            self.proj = LinearBase(
+                input_size=in_dim,
+                output_size=out_dim,
+                use_bias=False,
+                mesh=mesh,
+                kernel_axes=(None, None),
+                params_dtype=jnp.bfloat16,
+                scope_name="proj",
+            )
+            self.proj.weight = nnx.Param(
+                jax.ShapeDtypeStruct((in_dim, out_dim), jnp.bfloat16)
+            )
+
+    # Create temporary directory for checkpoint
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Save packed weights
+        # Weight shape for QuantizedLinear is [out_dim, in_dim // 2] packed in uint8
+        packed_weight = np.full((out_dim, in_dim // 2), 0xAB, dtype=np.uint8)
+        
+        # Weight scale shape: [out_dim]
+        weight_scale = np.ones((out_dim,), dtype=np.float32)
+
+        tensors = {
+            "model.layers.0.proj.weight": packed_weight,
+            "model.layers.0.proj.weight_scale_inv": weight_scale,
+        }
+        save_file(tensors, os.path.join(tmpdir, "model.safetensors"))
+
+        # Setup model config
+        class FakeHFConfig:
+            pass
+
+        class FakeQuantConfig:
+            is_static_checkpoint = True
+            ignored_layers = []
+            weight_block_size = None
+            
+            def get_linear_rules(self):
+                return [
+                    {
+                        "module_path": ".*",
+                        "weight_dtype": "int4",
+                        "activation_dtype": None,
+                        "weight_block_size": None,
+                    }
+                ]
+
+        hf_cfg = FakeHFConfig()
+        quant_cfg = FakeQuantConfig()
+
+        class FakeModelConfig:
+            def __init__(self):
+                self.model_path = tmpdir
+                self.hf_config = hf_cfg
+                self.quantization_config = quant_cfg
+
+        model_config = FakeModelConfig()
+
+        mesh = _create_single_device_mesh()
+        with jax.set_mesh(mesh):
+            model = DummyModel(mesh)
+
+        # 1. Apply linear quantization to swap to QuantizedLinear (dtype = int4)
+        apply_linear_quantization(model_config, model, is_static_input=True)
+        assert isinstance(model.proj, QuantizedLinear)
+        assert model.proj.weight_q.value.dtype == jnp.int4
+
+        # 2. Load weights using our WeightLoader with mappings
+        loader = WeightLoader(
+            model=model,
+            model_config=model_config,
+            mesh=mesh,
+            dtype=jnp.bfloat16,
+        )
+
+        mappings = {
+            "model.layers.0.proj.weight": WeightMapping(
+                target_path="proj.weight_q",
+                sharding=(None, None),
+                transpose=False,
+            ),
+            "model.layers.0.proj.weight_scale_inv": WeightMapping(
+                target_path="proj.weight_scale",
+                sharding=(None,),
+                transpose=False,
+            ),
+        }
+
+        loader.load_weights_from_safetensors(mappings)
+
+        # 3. Verify the unpacked values on TPU/device!
+        weight_unpacked = np.array(model.proj.weight_q.value)
+        
+        # 0xAB unpacked low=B(11 -> -5), high=A(10 -> -6)
+        assert np.all(weight_unpacked[:, 0::2] == -5), f"Expected -5, got {weight_unpacked[:, 0::2]}"
+        assert np.all(weight_unpacked[:, 1::2] == -6), f"Expected -6, got {weight_unpacked[:, 1::2]}"
+
+        print("4-bit unpacked loading verification SUCCESS!")
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

@@ -6,7 +6,7 @@ from enum import Enum, IntEnum, auto
 import jax.numpy as jnp
 from transformers import PretrainedConfig
 
-from sgl_jax.srt.configs.quantization_config import QuantizationConfig
+from sgl_jax.srt.configs.quantization_config import DTYPE_MAP, QuantizationConfig
 from sgl_jax.srt.hf_transformers_utils import (
     download_from_hf,
     get_config,
@@ -116,6 +116,8 @@ class ModelConfig:
         # None here would crash any repr() on the config (e.g. inside JAX tracing).
         if self.quantization_config is not None:
             self.hf_config.quantization_config = self.quantization_config
+            if hasattr(self.hf_config, "text_config") and self.hf_config.text_config is not None:
+                self.hf_config.text_config.quantization_config = self.quantization_config
 
         self.hf_generation_config = get_generation_config(
             config_path,
@@ -275,12 +277,12 @@ class ModelConfig:
                 return quant_config
 
             elif quant_method == "compressed-tensors":
-                # Check if it's float-quantized (fp8)
                 format_type = hf_quant_config.get("format")
-                if format_type == "float-quantized":
+                if format_type in ("float-quantized", "int-quantized", "pack-quantized"):
                     logger.info(
-                        "Auto-detected compressed-tensors FP8 model. "
-                        "Creating QuantizationConfig for static fp8."
+                        "Auto-detected compressed-tensors model (format: %s). "
+                        "Creating QuantizationConfig.",
+                        format_type,
                     )
 
                     def is_dynamic_fp8_act(cfg):
@@ -317,13 +319,17 @@ class ModelConfig:
                         # it — we run weight-only FP8 (BF16 activations).
                         logger.info(
                             "Detected dynamic per-token FP8 activation in checkpoint, "
-                            "but using weight-only mode (W8A16) for this run"
+                            "but using weight-only mode for this run"
                         )
 
-                    # Detect weight strategy from config_groups (per-channel vs block).
-                    # Ling-2.6-1T uses strategy="channel" → weight_block_size=None.
+                    # Detect weight strategy and dtype from config_groups
                     weight_strategy = None
                     weight_block_size = None
+                    weight_dtype_str = "float8_e4m3fn"  # default fallback
+                    weight_num_bits = 8
+                    weight_type = "float"
+                    weight_symmetric = True
+
                     if "config_groups" in hf_quant_config and isinstance(
                         hf_quant_config["config_groups"], dict
                     ):
@@ -342,13 +348,37 @@ class ModelConfig:
                                     int(block_structure[0]),
                                     int(block_structure[1]),
                                 )
+                            elif weight_strategy == "group":
+                                group_size = weights_cfg.get("group_size", 32)
+                                weight_block_size = (1, int(group_size))
+                            
+                            # Extract weight dtype properties
+                            weight_num_bits = weights_cfg.get("num_bits", 8)
+                            weight_type = weights_cfg.get("type", "float")
+                            weight_symmetric = weights_cfg.get("symmetric", True)
                             break
+
+                    # Map bits/type to JAX/unified string dtype names
+                    if weight_num_bits == 4:
+                        if weight_type == "int":
+                            weight_dtype_str = "int4" if weight_symmetric else "uint4"
+                        elif weight_type == "float":
+                            weight_dtype_str = "float4_e2m1fn"
+                    elif weight_num_bits == 8:
+                        if weight_type == "int":
+                            weight_dtype_str = "int8"
+                        elif weight_type == "float":
+                            weight_dtype_str = "float8_e4m3fn"
+
                     logger.info(
-                        "Compressed-tensors weight strategy=%s, weight_block_size=%s",
+                        "Compressed-tensors weight strategy=%s, weight_block_size=%s, "
+                        "resolved weight_dtype=%s",
                         weight_strategy,
                         weight_block_size,
+                        weight_dtype_str,
                     )
-                    if weight_strategy not in (None, "channel", "block", "tensor"):
+
+                    if weight_strategy not in (None, "channel", "block", "tensor", "group"):
                         raise NotImplementedError(
                             f"Unsupported compressed-tensors weight strategy: "
                             f"{weight_strategy!r}"
@@ -362,16 +392,18 @@ class ModelConfig:
                             len(ignored_layers),
                         )
 
+                    weight_dtype_jax = DTYPE_MAP.get(weight_dtype_str)
+
                     quant_config = QuantizationConfig(
                         is_static_checkpoint=True,
                         linear_rules=[
                             {
                                 "module_path": ".*",
-                                "weight_dtype": "float8_e4m3fn",
+                                "weight_dtype": weight_dtype_str,
                                 "activation_dtype": None,
                             }
                         ],
-                        moe_weight_dtype=jnp.float8_e4m3fn,
+                        moe_weight_dtype=weight_dtype_jax,
                         moe_activation_dtype=None,
                         ignored_layers=list(ignored_layers),
                         weight_block_size=weight_block_size,

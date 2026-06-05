@@ -12,7 +12,9 @@ from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Model
+from sgl_jax.srt.layers.moe import create_moe_weights_mapping
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.utils.quantization.quantization_utils import _is_layer_ignored
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -175,7 +177,7 @@ class KimiK25ForConditionalGeneration(nnx.Module):
                 and layer_idx % moe_layer_freq == 0
             )
             layer_mappings = self._create_layer_mappings(
-                layer_idx, is_moe, moe_backend, use_fused, is_static_quant
+                layer_idx, is_moe, moe_backend, use_fused, is_static_quant, model_config
             )
             mappings.update(layer_mappings)
 
@@ -188,6 +190,7 @@ class KimiK25ForConditionalGeneration(nnx.Module):
         moe_backend: str,
         use_fused: bool,
         is_static_quant: bool = False,
+        model_config: ModelConfig | None = None,
     ) -> dict:
         prefix = f"language_model.model.layers.{layer_idx}"
         target = f"model.layers.{layer_idx}"
@@ -200,7 +203,13 @@ class KimiK25ForConditionalGeneration(nnx.Module):
             #   Static FP8: loaded into QuantizedLinear.weight_q `[out, in]`
             #   directly; sharding is kernel_axes swapped. Also register the
             #   `weight_scale_inv` sidecar into `weight_scale`.
-            if not is_static_quant:
+            is_ignored = False
+            if model_config is not None and is_static_quant:
+                quant_cfg = getattr(model_config, "quantization_config", None)
+                if quant_cfg is not None:
+                    is_ignored = _is_layer_ignored(hf_prefix, quant_cfg.ignored_layers or [])
+
+            if not is_static_quant or is_ignored:
                 mappings[f"{hf_prefix}.weight"] = WeightMapping(
                     target_path=f"{target_prefix}.weight",
                     sharding=sharding_std,

@@ -377,20 +377,14 @@ def main():
     # Adjust constructor arguments to match your Flax class signature.  
 
     config = KimiK25ModelVitConfig
-    config.model_path = '/local/kimi'
+    config.model_path = '/dsk/models/kimi-bf16/'
     config.model_class = Kimi_K25_VisionModel
-
-    model = Kimi_K25_VisionModel(  
-        config,
-    )  
 
     devices = jax.devices()  
     mesh = jax.sharding.Mesh(np.array(devices), axis_names=("tensor",))  
   
     with jax.set_mesh(mesh):  
-        model = nnx.eval_shape(  
-            lambda: Kimi_K25_VisionModel(config, dtype=jnp.bfloat16, mesh=mesh)  
-        )  
+        model = Kimi_K25_VisionModel(config, dtype=jnp.bfloat16, mesh=mesh)  
       
     model.load_weights(config)  
   
