@@ -122,6 +122,8 @@ class SequentialSafetensorManager:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close_all()
 
+import threading
+_WEIGHT_LOAD_LOCK = threading.Lock()
 
 class WeightLoader:
     def __init__(
@@ -1853,420 +1855,421 @@ class WeightLoader:
             return
 
         # 1. Build index
-        weight_info = self._scan_weight_info()
+        with _WEIGHT_LOAD_LOCK:
+            weight_info = self._scan_weight_info()
 
-        regular_mappings = {}
-        moe_mappings = {}
+            regular_mappings = {}
+            moe_mappings = {}
 
-        for key, mapping in weight_mappings.items():
-            if "*" not in key:
-                if key.startswith("__MOE_EXPERTS__"):
-                    moe_mappings[key] = mapping
-                else:
-                    regular_mappings[key] = mapping
-            else:
-                key_as_regex = re.escape(key).replace(r"\*", r"(.*?)")
-                for weight_info_key, _ in weight_info.items():
-                    match = re.search(key_as_regex, weight_info_key)
-                    if match:
-                        matched_parts = match.groups()
-
-                        if isinstance(mapping, str):
-                            format_template = mapping.replace("*", "{}")
-                            replaced_mapping = format_template.format(*matched_parts)
-                        elif isinstance(mapping, list):
-                            format_template = mapping[0].replace("*", "{}")
-                            replaced_str = format_template.format(*matched_parts)
-                            replaced_mapping = [replaced_str, *mapping[1:]]
-                        elif isinstance(mapping, tuple):
-                            format_template = mapping[0].replace("*", "{}")
-                            replaced_str = format_template.format(*matched_parts)
-                            replaced_mapping = (replaced_str, *mapping[1:])
-                        elif isinstance(mapping, WeightMapping):
-                            format_template = mapping.target_path.replace("*", "{}")
-                            replaced_path = format_template.format(*matched_parts)
-                            replaced_mapping = copy.copy(mapping)
-                            replaced_mapping.target_path = replaced_path
-                        else:
-                            replaced_mapping = mapping
-
-                        if key.startswith("__MOE_EXPERTS__"):
-                            moe_mappings[weight_info_key] = replaced_mapping
-                        else:
-                            regular_mappings[weight_info_key] = replaced_mapping
-
-        logger.info("Starting parallel weight loading via JAX Lazy Loader...")
-        quant_cfg = getattr(self.model_config, "quantization_config", None)
-        is_static_quant = quant_cfg is not None and quant_cfg.is_static_checkpoint
-
-        with SequentialSafetensorManager() as file_manager:
-            # 2. Process Regular Weights (Lazy Pull)
-            for hf_key, mapping in tqdm(regular_mappings.items(), desc="Loading Regular Weights"):
-                if hf_key not in weight_info:
-                    if hf_key == "d2t":
-                        logger.warning("Weight %s not found in safetensors index.", hf_key)
-                        continue
-                    if self._is_excluded_layer_weight(hf_key):
-                        logger.debug("Skipping excluded layer weight: %s", hf_key)
-                        continue
+            for key, mapping in weight_mappings.items():
+                if "*" not in key:
+                    if key.startswith("__MOE_EXPERTS__"):
+                        moe_mappings[key] = mapping
                     else:
-                        logger.warning("No file found for weight: %s", hf_key)
-                        continue
-
-                infos = weight_info[hf_key]
-
-                if isinstance(mapping, str | list):
-                    mapping = WeightMapping(target_path=mapping)
-
-                is_split_weight = len(infos) > 1 and mapping.concat_axis is not None
-
-                can_optimize = (
-                    isinstance(mapping.target_path, str)
-                    and not mapping.target_path.startswith("__FUSED_QKV_")
-                    and not mapping.target_path.startswith("__KV_")
-                    and mapping.reshape is None
-                    and mapping.repeat is None  # Check repeat here too!
-                    and not mapping.kv_head_padding
-                    and not mapping.head_dim_padding
-                    and mapping.sharding is not None
-                    and hf_key != "d2t"
-                )
-
-                if can_optimize:
-                    try:
-                        if mapping.transpose and len(mapping.sharding) == 2:
-                            # Swap: (dim0, dim1) -> (dim1, dim0)
-                            sharding_tuple = mapping.sharding[::-1]
-                        else:
-                            sharding_tuple = mapping.sharding
-
-                        spec = P(*sharding_tuple)
-                        final_sharding = jax.sharding.NamedSharding(self.mesh, spec)
-
-                        lazy_weight = None
-
-                        if is_split_weight:
-                            lazy_weight = self._create_split_lazy_tensor(
-                                hf_key,
-                                infos,
-                                file_manager,
-                                concat_axis=mapping.concat_axis,
-                                target_sharding=final_sharding,
-                            )
-                        else:
-                            lazy_arrays = self._create_lazy_tensors(
-                                hf_key,
-                                infos,
-                                file_manager,
-                                target_sharding=final_sharding,
-                            )
-                            lazy_weight = lazy_arrays[0]
-
-                        # Handle multi-dimensional transpose (transpose_axes) or 2D transpose
-                        if mapping.transpose_axes is not None:
-                            lazy_weight = jnp.transpose(lazy_weight, mapping.transpose_axes)
-                        elif mapping.transpose:
-                            lazy_weight = jnp.transpose(lazy_weight, (1, 0))
-
-                        if "lm_head" in hf_key and hasattr(
-                            self.model_config.hf_config, "output_multiplier_scale"
-                        ):
-                            lazy_weight = (
-                                lazy_weight.astype(jnp.float32)
-                                * self.model_config.hf_config.output_multiplier_scale
-                            )
-
-                        target_path = mapping.target_path
-                        model_param = self._get_param(params, target_path)
-
-                        # Expand 2D block-quant scale to 3D kernel-ready layout.
-                        lazy_weight = self._maybe_expand_linear_block_scale(
-                            lazy_weight, model_param, target_path
-                        )
-
-                        if lazy_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
-                            model_param.value = lazy_weight
-                        else:
-                            model_param.value = lazy_weight.astype(model_param.value.dtype)
-
-                        mode_str = "Split-Stitch" if is_split_weight else "Direct"
-                        logger.debug(
-                            "Fast Loading %s -> %s (%s), shape: %s",
-                            hf_key,
-                            target_path,
-                            mode_str,
-                            lazy_weight.shape,
-                        )
-                        continue
-
-                    except Exception as e:
-                        logger.warning(
-                            "Fast load failed for %s, falling back to slow path. Error: %s",
-                            hf_key,
-                            str(e),
-                        )
-                lazy_arrays = self._create_lazy_tensors(
-                    hf_key,
-                    infos,
-                    file_manager,
-                    target_sharding=None,
-                )
-
-                if len(lazy_arrays) > 1 and mapping.concat_axis is not None:
-                    lazy_weight = jnp.concatenate(lazy_arrays, axis=mapping.concat_axis)
+                        regular_mappings[key] = mapping
                 else:
-                    lazy_weight = lazy_arrays[0]
+                    key_as_regex = re.escape(key).replace(r"\*", r"(.*?)")
+                    for weight_info_key, _ in weight_info.items():
+                        match = re.search(key_as_regex, weight_info_key)
+                        if match:
+                            matched_parts = match.groups()
 
-                if hf_key == "d2t":
-                    base = jnp.arange(lazy_weight.shape[0], dtype=lazy_weight.dtype)
-                    hot_ids = (lazy_weight + base).astype(jnp.int32)
-                    params["hot_token_ids"].value = hot_ids
-                    continue
+                            if isinstance(mapping, str):
+                                format_template = mapping.replace("*", "{}")
+                                replaced_mapping = format_template.format(*matched_parts)
+                            elif isinstance(mapping, list):
+                                format_template = mapping[0].replace("*", "{}")
+                                replaced_str = format_template.format(*matched_parts)
+                                replaced_mapping = [replaced_str, *mapping[1:]]
+                            elif isinstance(mapping, tuple):
+                                format_template = mapping[0].replace("*", "{}")
+                                replaced_str = format_template.format(*matched_parts)
+                                replaced_mapping = (replaced_str, *mapping[1:])
+                            elif isinstance(mapping, WeightMapping):
+                                format_template = mapping.target_path.replace("*", "{}")
+                                replaced_path = format_template.format(*matched_parts)
+                                replaced_mapping = copy.copy(mapping)
+                                replaced_mapping.target_path = replaced_path
+                            else:
+                                replaced_mapping = mapping
 
-                self._process_and_assign_weight(params, hf_key, lazy_weight, mapping)
+                            if key.startswith("__MOE_EXPERTS__"):
+                                moe_mappings[weight_info_key] = replaced_mapping
+                            else:
+                                regular_mappings[weight_info_key] = replaced_mapping
 
-            # 3. Process MoE Weights (Lazy Pull)
-            for moe_key, mapping in tqdm(moe_mappings.items(), desc="Loading MoE Weights"):
-                expected_hf_keys = mapping.target_path[1:]
+            logger.info("Starting parallel weight loading via JAX Lazy Loader...")
+            quant_cfg = getattr(self.model_config, "quantization_config", None)
+            is_static_quant = quant_cfg is not None and quant_cfg.is_static_checkpoint
 
-                group_complete = True
-                is_tp_split = False
-
-                # Validation pass
-                for hf_key in expected_hf_keys:
+            with SequentialSafetensorManager() as file_manager:
+                # 2. Process Regular Weights (Lazy Pull)
+                for hf_key, mapping in tqdm(regular_mappings.items(), desc="Loading Regular Weights"):
                     if hf_key not in weight_info:
+                        if hf_key == "d2t":
+                            logger.warning("Weight %s not found in safetensors index.", hf_key)
+                            continue
                         if self._is_excluded_layer_weight(hf_key):
-                            logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
+                            logger.debug("Skipping excluded layer weight: %s", hf_key)
+                            continue
                         else:
-                            logger.warning("MoE expert weight %s not found.", hf_key)
-                            raise ValueError(f"MoE expert weight {hf_key} not found.")
-                        group_complete = False
-                        break
+                            logger.warning("No file found for weight: %s", hf_key)
+                            continue
 
                     infos = weight_info[hf_key]
 
-                    # Check for TP split (Grok style)
-                    if mapping.concat_axis is not None:
-                        if len(infos) > 1:
-                            is_tp_split = True
+                    if isinstance(mapping, str | list):
+                        mapping = WeightMapping(target_path=mapping)
 
-                        if len(infos) < safetensors_partition:
-                            logger.warning(
-                                "Incomplete shards for %s: expected %s, found %s",
-                                hf_key,
-                                safetensors_partition,
-                                len(infos),
+                    is_split_weight = len(infos) > 1 and mapping.concat_axis is not None
+
+                    can_optimize = (
+                        isinstance(mapping.target_path, str)
+                        and not mapping.target_path.startswith("__FUSED_QKV_")
+                        and not mapping.target_path.startswith("__KV_")
+                        and mapping.reshape is None
+                        and mapping.repeat is None  # Check repeat here too!
+                        and not mapping.kv_head_padding
+                        and not mapping.head_dim_padding
+                        and mapping.sharding is not None
+                        and hf_key != "d2t"
+                    )
+
+                    if can_optimize:
+                        try:
+                            if mapping.transpose and len(mapping.sharding) == 2:
+                                # Swap: (dim0, dim1) -> (dim1, dim0)
+                                sharding_tuple = mapping.sharding[::-1]
+                            else:
+                                sharding_tuple = mapping.sharding
+
+                            spec = P(*sharding_tuple)
+                            final_sharding = jax.sharding.NamedSharding(self.mesh, spec)
+
+                            lazy_weight = None
+
+                            if is_split_weight:
+                                lazy_weight = self._create_split_lazy_tensor(
+                                    hf_key,
+                                    infos,
+                                    file_manager,
+                                    concat_axis=mapping.concat_axis,
+                                    target_sharding=final_sharding,
+                                )
+                            else:
+                                lazy_arrays = self._create_lazy_tensors(
+                                    hf_key,
+                                    infos,
+                                    file_manager,
+                                    target_sharding=final_sharding,
+                                )
+                                lazy_weight = lazy_arrays[0]
+
+                            # Handle multi-dimensional transpose (transpose_axes) or 2D transpose
+                            if mapping.transpose_axes is not None:
+                                lazy_weight = jnp.transpose(lazy_weight, mapping.transpose_axes)
+                            elif mapping.transpose:
+                                lazy_weight = jnp.transpose(lazy_weight, (1, 0))
+
+                            if "lm_head" in hf_key and hasattr(
+                                self.model_config.hf_config, "output_multiplier_scale"
+                            ):
+                                lazy_weight = (
+                                    lazy_weight.astype(jnp.float32)
+                                    * self.model_config.hf_config.output_multiplier_scale
+                                )
+
+                            target_path = mapping.target_path
+                            model_param = self._get_param(params, target_path)
+
+                            # Expand 2D block-quant scale to 3D kernel-ready layout.
+                            lazy_weight = self._maybe_expand_linear_block_scale(
+                                lazy_weight, model_param, target_path
                             )
+
+                            if lazy_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+                                model_param.value = lazy_weight
+                            else:
+                                model_param.value = lazy_weight.astype(model_param.value.dtype)
+
+                            mode_str = "Split-Stitch" if is_split_weight else "Direct"
+                            logger.debug(
+                                "Fast Loading %s -> %s (%s), shape: %s",
+                                hf_key,
+                                target_path,
+                                mode_str,
+                                lazy_weight.shape,
+                            )
+                            continue
+
+                        except Exception as e:
+                            logger.warning(
+                                "Fast load failed for %s, falling back to slow path. Error: %s",
+                                hf_key,
+                                str(e),
+                            )
+                    lazy_arrays = self._create_lazy_tensors(
+                        hf_key,
+                        infos,
+                        file_manager,
+                        target_sharding=None,
+                    )
+
+                    if len(lazy_arrays) > 1 and mapping.concat_axis is not None:
+                        lazy_weight = jnp.concatenate(lazy_arrays, axis=mapping.concat_axis)
+                    else:
+                        lazy_weight = lazy_arrays[0]
+
+                    if hf_key == "d2t":
+                        base = jnp.arange(lazy_weight.shape[0], dtype=lazy_weight.dtype)
+                        hot_ids = (lazy_weight + base).astype(jnp.int32)
+                        params["hot_token_ids"].value = hot_ids
+                        continue
+
+                    self._process_and_assign_weight(params, hf_key, lazy_weight, mapping)
+
+                # 3. Process MoE Weights (Lazy Pull)
+                for moe_key, mapping in tqdm(moe_mappings.items(), desc="Loading MoE Weights"):
+                    expected_hf_keys = mapping.target_path[1:]
+
+                    group_complete = True
+                    is_tp_split = False
+
+                    # Validation pass
+                    for hf_key in expected_hf_keys:
+                        if hf_key not in weight_info:
+                            if self._is_excluded_layer_weight(hf_key):
+                                logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
+                            else:
+                                logger.warning("MoE expert weight %s not found.", hf_key)
+                                raise ValueError(f"MoE expert weight {hf_key} not found.")
                             group_complete = False
                             break
 
-                if not group_complete:
-                    continue
+                        infos = weight_info[hf_key]
 
-                # OPTIMIZATION: Use Stacked Loader if no TP split
-                if not is_tp_split and mapping.concat_axis is None:
-                    # 1. Pre-construct target sharding
-                    if "expert" in mapping.sharding:
+                        # Check for TP split (Grok style)
+                        if mapping.concat_axis is not None:
+                            if len(infos) > 1:
+                                is_tp_split = True
+
+                            if len(infos) < safetensors_partition:
+                                logger.warning(
+                                    "Incomplete shards for %s: expected %s, found %s",
+                                    hf_key,
+                                    safetensors_partition,
+                                    len(infos),
+                                )
+                                group_complete = False
+                                break
+
+                    if not group_complete:
+                        continue
+
+                    # OPTIMIZATION: Use Stacked Loader if no TP split
+                    if not is_tp_split and mapping.concat_axis is None:
+                        # 1. Pre-construct target sharding
+                        if "expert" in mapping.sharding:
+                            ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
+                            world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get(
+                                "tensor", 1
+                            )
+                            tp_size = world_size // ep_size
+
+                            devices = self.mesh.devices.flatten()
+                            # Construct MoE specific mesh
+                            moe_mesh = jax.sharding.Mesh(
+                                devices.reshape(ep_size, tp_size),
+                                axis_names=("expert", "tensor"),
+                                axis_types=(
+                                    jax.sharding.AxisType.Explicit,
+                                    jax.sharding.AxisType.Explicit,
+                                ),
+                            )
+                            final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
+                        else:
+                            # Standard Sharding
+                            final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
+
+                        # 2. Call creator
+                        _t_load_start = time.monotonic()
+                        stacked_weight = self._create_stacked_moe_lazy_tensor(
+                            expected_hf_keys,
+                            weight_info,
+                            file_manager,
+                            do_transpose=mapping.transpose,  # CPU transpose
+                            target_sharding=final_sharding,  # Global loading
+                            physical_to_logical_map=mapping.physical_to_logical_map,
+                        )
+                        _t_load = time.monotonic() - _t_load_start
+                        loaded_shape = stacked_weight.shape
+
+                        if mapping.reshape is not None:
+                            stacked_weight = jnp.reshape(stacked_weight, mapping.reshape)
+
+                        if mapping.repeat is not None:
+                            axis, times = mapping.repeat
+                            stacked_weight = jnp.repeat(stacked_weight, times, axis=axis)
+
+                        # 3. Direct assignment
+                        target_path = mapping.target_path[0]
+                        model_param = self._get_param(params, target_path)
+                        stacked_weight = self._maybe_convert_epmoe_scale_for_kernel(
+                            stacked_weight,
+                            model_param,
+                            target_path,
+                        )
+
+                        if is_static_quant and moe_key.endswith("_scale"):
+                            logger.debug(
+                                "MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
+                                "param_shape=%s reshape=%s repeat=%s sharding=%s",
+                                moe_key,
+                                target_path,
+                                loaded_shape,
+                                stacked_weight.shape,
+                                model_param.value.shape,
+                                mapping.reshape,
+                                mapping.repeat,
+                                mapping.sharding,
+                            )
+
+                        try:
+                            _t_assign_start = time.monotonic()
+                            if stacked_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+                                model_param.value = stacked_weight
+                            else:
+                                model_param.value = stacked_weight.astype(model_param.value.dtype)
+                            _t_assign = time.monotonic() - _t_assign_start
+                            logger.debug(
+                                "MoE group %s: load=%.2fs assign=%.2fs total=%.2fs "
+                                "shape=%s sharding=%s",
+                                moe_key,
+                                _t_load,
+                                _t_assign,
+                                _t_load + _t_assign,
+                                loaded_shape,
+                                mapping.sharding,
+                            )
+                        except Exception as e:
+                            logger.error(
+                                "Failed MoE assign group=%s target=%s loaded_shape=%s final_shape=%s "
+                                "param_shape=%s reshape=%s repeat=%s sharding=%s err=%s",
+                                moe_key,
+                                target_path,
+                                loaded_shape,
+                                stacked_weight.shape,
+                                model_param.value.shape,
+                                mapping.reshape,
+                                mapping.repeat,
+                                mapping.sharding,
+                                str(e),
+                            )
+                            raise
+
+                        if mapping.physical_to_logical_map is not None:
+                            num_logical = len(expected_hf_keys)
+                            num_physical = len(mapping.physical_to_logical_map)
+                            logger.info(
+                                "Assigned MoE group %s with redundant experts: %d logical -> %d physical, shape: %s",
+                                moe_key,
+                                num_logical,
+                                num_physical,
+                                stacked_weight.shape,
+                            )
+                        else:
+                            logger.info(
+                                "Assigned MoE group %s, shape: %s",
+                                moe_key,
+                                stacked_weight.shape,
+                            )
+                    else:
                         ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
-                        world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get(
-                            "tensor", 1
-                        )
-                        tp_size = world_size // ep_size
-
-                        devices = self.mesh.devices.flatten()
-                        # Construct MoE specific mesh
-                        moe_mesh = jax.sharding.Mesh(
-                            devices.reshape(ep_size, tp_size),
-                            axis_names=("expert", "tensor"),
-                            axis_types=(
-                                jax.sharding.AxisType.Explicit,
-                                jax.sharding.AxisType.Explicit,
-                            ),
-                        )
-                        final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
-                    else:
-                        # Standard Sharding
-                        final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
-
-                    # 2. Call creator
-                    _t_load_start = time.monotonic()
-                    stacked_weight = self._create_stacked_moe_lazy_tensor(
-                        expected_hf_keys,
-                        weight_info,
-                        file_manager,
-                        do_transpose=mapping.transpose,  # CPU transpose
-                        target_sharding=final_sharding,  # Global loading
-                        physical_to_logical_map=mapping.physical_to_logical_map,
-                    )
-                    _t_load = time.monotonic() - _t_load_start
-                    loaded_shape = stacked_weight.shape
-
-                    if mapping.reshape is not None:
-                        stacked_weight = jnp.reshape(stacked_weight, mapping.reshape)
-
-                    if mapping.repeat is not None:
-                        axis, times = mapping.repeat
-                        stacked_weight = jnp.repeat(stacked_weight, times, axis=axis)
-
-                    # 3. Direct assignment
-                    target_path = mapping.target_path[0]
-                    model_param = self._get_param(params, target_path)
-                    stacked_weight = self._maybe_convert_epmoe_scale_for_kernel(
-                        stacked_weight,
-                        model_param,
-                        target_path,
-                    )
-
-                    if is_static_quant and moe_key.endswith("_scale"):
-                        logger.debug(
-                            "MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
-                            "param_shape=%s reshape=%s repeat=%s sharding=%s",
-                            moe_key,
-                            target_path,
-                            loaded_shape,
-                            stacked_weight.shape,
-                            model_param.value.shape,
-                            mapping.reshape,
-                            mapping.repeat,
-                            mapping.sharding,
-                        )
-
-                    try:
-                        _t_assign_start = time.monotonic()
-                        if stacked_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
-                            model_param.value = stacked_weight
+                        if "expert" in mapping.sharding:
+                            world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get(
+                                "tensor", 1
+                            )
+                            tp_size = world_size // ep_size
+                            devices = self.mesh.devices.flatten()
+                            moe_mesh = jax.sharding.Mesh(
+                                devices.reshape(ep_size, tp_size),
+                                axis_names=("expert", "tensor"),
+                                axis_types=(
+                                    jax.sharding.AxisType.Explicit,
+                                    jax.sharding.AxisType.Explicit,
+                                ),
+                            )
+                            # Use regular mesh for loading individual expert weights (TP sharding only)
+                            final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
                         else:
-                            model_param.value = stacked_weight.astype(model_param.value.dtype)
-                        _t_assign = time.monotonic() - _t_assign_start
-                        logger.debug(
-                            "MoE group %s: load=%.2fs assign=%.2fs total=%.2fs "
-                            "shape=%s sharding=%s",
-                            moe_key,
-                            _t_load,
-                            _t_assign,
-                            _t_load + _t_assign,
-                            loaded_shape,
-                            mapping.sharding,
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "Failed MoE assign group=%s target=%s loaded_shape=%s final_shape=%s "
-                            "param_shape=%s reshape=%s repeat=%s sharding=%s err=%s",
-                            moe_key,
-                            target_path,
-                            loaded_shape,
-                            stacked_weight.shape,
-                            model_param.value.shape,
-                            mapping.reshape,
-                            mapping.repeat,
-                            mapping.sharding,
-                            str(e),
-                        )
-                        raise
+                            final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
 
-                    if mapping.physical_to_logical_map is not None:
-                        num_logical = len(expected_hf_keys)
-                        num_physical = len(mapping.physical_to_logical_map)
+                        expert_weights = self._create_stacked_split_moe_lazy_tensor(
+                            expected_hf_keys,
+                            weight_info,
+                            file_manager,
+                            concat_axis=mapping.concat_axis,
+                            do_transpose=mapping.transpose,
+                            target_sharding=final_sharding,
+                            physical_to_logical_map=mapping.physical_to_logical_map,
+                        )
+                        loaded_shape = expert_weights.shape
+
+                        if mapping.reshape is not None:
+                            expert_weights = jnp.reshape(expert_weights, mapping.reshape)
+
+                        if mapping.repeat is not None:
+                            axis, times = mapping.repeat
+                            expert_weights = jnp.repeat(expert_weights, times, axis=axis)
+
+                        target_path = mapping.target_path[0]
+                        model_param = self._get_param(params, target_path)
+                        expert_weights = self._maybe_convert_epmoe_scale_for_kernel(
+                            expert_weights,
+                            model_param,
+                            target_path,
+                        )
+
+                        if is_static_quant and moe_key.endswith("_scale"):
+                            logger.debug(
+                                "Split-MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
+                                "param_shape=%s reshape=%s repeat=%s sharding=%s",
+                                moe_key,
+                                target_path,
+                                loaded_shape,
+                                expert_weights.shape,
+                                model_param.value.shape,
+                                mapping.reshape,
+                                mapping.repeat,
+                                mapping.sharding,
+                            )
+
+                        try:
+                            if expert_weights.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+                                model_param.value = expert_weights
+                            else:
+                                model_param.value = expert_weights.astype(model_param.value.dtype)
+                        except Exception as e:
+                            logger.error(
+                                "Failed Split-MoE assign group=%s target=%s loaded_shape=%s final_shape=%s "
+                                "param_shape=%s reshape=%s repeat=%s sharding=%s err=%s",
+                                moe_key,
+                                target_path,
+                                loaded_shape,
+                                expert_weights.shape,
+                                model_param.value.shape,
+                                mapping.reshape,
+                                mapping.repeat,
+                                mapping.sharding,
+                                str(e),
+                            )
+                            raise
+
                         logger.info(
-                            "Assigned MoE group %s with redundant experts: %d logical -> %d physical, shape: %s",
+                            "Assigned MoE group %s (Grok Split-Stitch), shape: %s",
                             moe_key,
-                            num_logical,
-                            num_physical,
-                            stacked_weight.shape,
-                        )
-                    else:
-                        logger.info(
-                            "Assigned MoE group %s, shape: %s",
-                            moe_key,
-                            stacked_weight.shape,
-                        )
-                else:
-                    ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
-                    if "expert" in mapping.sharding:
-                        world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get(
-                            "tensor", 1
-                        )
-                        tp_size = world_size // ep_size
-                        devices = self.mesh.devices.flatten()
-                        moe_mesh = jax.sharding.Mesh(
-                            devices.reshape(ep_size, tp_size),
-                            axis_names=("expert", "tensor"),
-                            axis_types=(
-                                jax.sharding.AxisType.Explicit,
-                                jax.sharding.AxisType.Explicit,
-                            ),
-                        )
-                        # Use regular mesh for loading individual expert weights (TP sharding only)
-                        final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
-                    else:
-                        final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
-
-                    expert_weights = self._create_stacked_split_moe_lazy_tensor(
-                        expected_hf_keys,
-                        weight_info,
-                        file_manager,
-                        concat_axis=mapping.concat_axis,
-                        do_transpose=mapping.transpose,
-                        target_sharding=final_sharding,
-                        physical_to_logical_map=mapping.physical_to_logical_map,
-                    )
-                    loaded_shape = expert_weights.shape
-
-                    if mapping.reshape is not None:
-                        expert_weights = jnp.reshape(expert_weights, mapping.reshape)
-
-                    if mapping.repeat is not None:
-                        axis, times = mapping.repeat
-                        expert_weights = jnp.repeat(expert_weights, times, axis=axis)
-
-                    target_path = mapping.target_path[0]
-                    model_param = self._get_param(params, target_path)
-                    expert_weights = self._maybe_convert_epmoe_scale_for_kernel(
-                        expert_weights,
-                        model_param,
-                        target_path,
-                    )
-
-                    if is_static_quant and moe_key.endswith("_scale"):
-                        logger.debug(
-                            "Split-MoE scale debug group=%s target=%s loaded_shape=%s final_shape=%s "
-                            "param_shape=%s reshape=%s repeat=%s sharding=%s",
-                            moe_key,
-                            target_path,
-                            loaded_shape,
                             expert_weights.shape,
-                            model_param.value.shape,
-                            mapping.reshape,
-                            mapping.repeat,
-                            mapping.sharding,
                         )
-
-                    try:
-                        if expert_weights.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
-                            model_param.value = expert_weights
-                        else:
-                            model_param.value = expert_weights.astype(model_param.value.dtype)
-                    except Exception as e:
-                        logger.error(
-                            "Failed Split-MoE assign group=%s target=%s loaded_shape=%s final_shape=%s "
-                            "param_shape=%s reshape=%s repeat=%s sharding=%s err=%s",
-                            moe_key,
-                            target_path,
-                            loaded_shape,
-                            expert_weights.shape,
-                            model_param.value.shape,
-                            mapping.reshape,
-                            mapping.repeat,
-                            mapping.sharding,
-                            str(e),
-                        )
-                        raise
-
-                    logger.info(
-                        "Assigned MoE group %s (Grok Split-Stitch), shape: %s",
-                        moe_key,
-                        expert_weights.shape,
-                    )
 
         nnx.update(self.model, params)
         logger.info("All weights loaded successfully.")

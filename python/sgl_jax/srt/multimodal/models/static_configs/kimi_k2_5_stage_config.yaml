@@ -14,7 +14,7 @@ stage_args:
  - stage_id: 1
    stage_sub_dir: ""
    runtime:
-     num_tpus: 8
+     num_tpus: 32
      max_batch_size: 1
    scheduler: auto_regressive
    scheduler_params: {}

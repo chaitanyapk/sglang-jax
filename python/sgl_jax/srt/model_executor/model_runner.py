@@ -271,7 +271,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
 
     def get_available_device_memory(self):
-        distributed = jax.process_count() != 1
+        distributed = jax.process_count() != 1 and self.server_args.nnodes > 1
         min_available_device_memory = get_available_device_memory(
             self.device, distributed=distributed, device_indexes=self.server_args.device_indexes
         )
