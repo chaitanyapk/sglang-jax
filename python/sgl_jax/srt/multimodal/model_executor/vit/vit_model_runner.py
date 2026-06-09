@@ -179,19 +179,17 @@ class VitModelRunner(BaseModelRunner):
         return jnp.where(condition, update_values, text_embeds)
 
     def forward(self, batch: Req, mesh: jax.sharding.Mesh):
-        print(f"VIT Runner pixel values: {batch.pixel_values.shape}")
-        print(f"VIT Runner grid shape values: {batch.image_grid_thw}")
-        vision_embeds = self.jitted_encode_vision(
-            pixel_values=batch.pixel_values,
-            image_grid_thw=batch.image_grid_thw,
-            video_grid_thw=batch.video_grid_thw,
-        )
+        #vision_embeds = self.jitted_encode_vision(
+        #    pixel_values=batch.pixel_values,
+        #    image_grid_thw=batch.image_grid_thw,
+        #    video_grid_thw=batch.video_grid_thw,
+        #)
 
         print("Vision embeddings successfully calculated", flush=True)
 
-        vision_embeds = self.model.mm_projector(vision_embeds)
+        #vision_embeds = self.model.mm_projector(vision_embeds)
 
-        print(f"Vision embeddings successfully worked with mm_projection: {vision_embeds.shape}", flush=True)
+        #print(f"Vision embeddings successfully worked with mm_projection: {vision_embeds.shape}", flush=True)
 
         mm_inputs = batch.omni_inputs if isinstance(batch.omni_inputs, dict) else None
         if mm_inputs is not None:
@@ -201,7 +199,7 @@ class VitModelRunner(BaseModelRunner):
                 input_ids = jnp.asarray(input_ids)
                 merged_embeds = self._merge_multimodal_embeddings(
                     input_ids=input_ids,
-                    vision_embeds=vision_embeds,
+                    vision_embeds=None,
                     mm_inputs=mm_inputs,
                 )
                 if merged_embeds is not None:
